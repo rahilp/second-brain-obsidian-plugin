@@ -3,7 +3,7 @@
   "name": "Second Brain Sync",
   "version": "1.0.0",
   "minAppVersion": "1.4.0",
-  "description": "Sync your Obsidian notes to your self-hosted Second Brain MCP server on Cloudflare Workers. Search your brain from inside Obsidian.",
+  "description": "Sync your notes to your self-hosted Second Brain MCP server on Cloudflare Workers.",
   "author": "Rahil Pirani",
   "authorUrl": "https://github.com/rahilp",
   "fundingUrl": "https://github.com/rahilp/second-brain-cloudflare",
