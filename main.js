@@ -154,7 +154,7 @@ var SecondBrainPlugin = class extends import_obsidian.Plugin {
     });
     this.addCommand({
       id: "sync-all-tagged",
-      name: "Sync all tagged notes to Second Brain",
+      name: "Sync all notes to Second Brain",
       callback: () => this.syncAllTagged()
     });
     this.addCommand({
@@ -173,9 +173,8 @@ var SecondBrainPlugin = class extends import_obsidian.Plugin {
     }
     this.addSettingTab(new SecondBrainSettingTab(this.app, this));
   }
-  onunload() {
-    this.app.workspace.detachLeavesOfType(SIDEBAR_VIEW_TYPE);
-  }
+  // FIX 1: removed onunload that called detachLeavesOfType
+  // Obsidian handles leaf lifecycle automatically
   // ── Sync methods ────────────────────────────────────────────────────────────
   async syncActiveNote() {
     const file = this.app.workspace.getActiveFile();
@@ -187,6 +186,10 @@ var SecondBrainPlugin = class extends import_obsidian.Plugin {
   }
   async syncIfTagged(file) {
     var _a, _b;
+    if (this.settings.syncMode === "all") {
+      await this.syncFile(file);
+      return;
+    }
     const cache = this.app.metadataCache.getFileCache(file);
     const tags = (_b = (_a = cache == null ? void 0 : cache.frontmatter) == null ? void 0 : _a.tags) != null ? _b : [];
     if (!tags.includes(this.settings.syncTag))
@@ -208,8 +211,7 @@ var SecondBrainPlugin = class extends import_obsidian.Plugin {
       return;
     }
     new import_obsidian.Notice(`Syncing ${tagged.length} notes...`);
-    let synced = 0;
-    let failed = 0;
+    let synced = 0, failed = 0;
     for (const file of tagged) {
       const ok = await this.syncFile(file, true);
       if (ok)
@@ -324,8 +326,8 @@ var SecondBrainSettingTab = class extends import_obsidian.PluginSettingTab {
   display() {
     const { containerEl } = this;
     containerEl.empty();
-    containerEl.createEl("h2", { text: "Second Brain Settings" });
-    containerEl.createEl("h3", { text: "Connection" });
+    new import_obsidian.Setting(containerEl).setName("Second Brain").setHeading();
+    new import_obsidian.Setting(containerEl).setName("Connection").setHeading();
     new import_obsidian.Setting(containerEl).setName("Worker URL").setDesc("Your Cloudflare Worker URL \u2014 e.g. https://second-brain.yourname.workers.dev").addText(
       (text) => text.setPlaceholder("https://second-brain.yourname.workers.dev").setValue(this.plugin.settings.workerUrl).onChange(async (value) => {
         this.plugin.settings.workerUrl = value.trim().replace(/\/$/, "");
@@ -362,7 +364,7 @@ var SecondBrainSettingTab = class extends import_obsidian.PluginSettingTab {
         }
       })
     );
-    containerEl.createEl("h3", { text: "Sync behaviour" });
+    new import_obsidian.Setting(containerEl).setName("Sync behaviour").setHeading();
     new import_obsidian.Setting(containerEl).setName("Sync mode").setDesc("Sync all notes in your vault, or only notes with a specific tag.").addDropdown((dropdown) => {
       dropdown.addOption("tagged", "Tagged notes only").addOption("all", "All notes").setValue(this.plugin.settings.syncMode).onChange(async (value) => {
         this.plugin.settings.syncMode = value;
@@ -384,11 +386,7 @@ var SecondBrainSettingTab = class extends import_obsidian.PluginSettingTab {
         await this.plugin.saveSettings();
       })
     );
-    containerEl.createEl("h3", { text: "Chunking" });
-    containerEl.createEl("p", {
-      text: "Long notes are split into overlapping segments so each part gets a clean embedding. Short notes are stored as-is.",
-      cls: "setting-item-description"
-    });
+    new import_obsidian.Setting(containerEl).setName("Chunking").setDesc("Long notes are split into overlapping segments so each part gets a clean embedding. Short notes are stored as-is.").setHeading();
     new import_obsidian.Setting(containerEl).setName("Chunk size (characters)").setDesc("Maximum characters per chunk. Default: 1600 (~400 tokens)").addSlider(
       (slider) => slider.setLimits(400, 4e3, 100).setValue(this.plugin.settings.chunkSize).setDynamicTooltip().onChange(async (value) => {
         this.plugin.settings.chunkSize = value;
@@ -401,14 +399,14 @@ var SecondBrainSettingTab = class extends import_obsidian.PluginSettingTab {
         await this.plugin.saveSettings();
       })
     );
-    containerEl.createEl("h3", { text: "Display" });
+    new import_obsidian.Setting(containerEl).setName("Display").setHeading();
     new import_obsidian.Setting(containerEl).setName("Show sync status in status bar").setDesc("Shows the last sync time in the Obsidian status bar").addToggle(
       (toggle) => toggle.setValue(this.plugin.settings.showSyncStatus).onChange(async (value) => {
         this.plugin.settings.showSyncStatus = value;
         await this.plugin.saveSettings();
       })
     );
-    containerEl.createEl("h3", { text: "Actions" });
+    new import_obsidian.Setting(containerEl).setName("Actions").setHeading();
     new import_obsidian.Setting(containerEl).setName("Sync now").setDesc(this.plugin.settings.syncMode === "all" ? "Sync all notes in your vault to your Second Brain" : `Sync all notes tagged with "${this.plugin.settings.syncTag}" to your Second Brain`).addButton(
       (btn) => btn.setButtonText("Sync all").setCta().onClick(() => this.plugin.syncAllTagged())
     );

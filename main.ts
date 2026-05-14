@@ -52,31 +52,19 @@ class SecondBrainSidebarView extends ItemView {
     this.plugin = plugin;
   }
 
-  getViewType() {
-    return SIDEBAR_VIEW_TYPE;
-  }
+  getViewType() { return SIDEBAR_VIEW_TYPE; }
+  getDisplayText() { return "Second Brain"; }
+  getIcon() { return "brain"; }
 
-  getDisplayText() {
-    return "Second Brain";
-  }
-
-  getIcon() {
-    return "brain";
-  }
-
-  async onOpen() {
-    this.render();
-  }
+  async onOpen() { this.render(); }
 
   render() {
     const container = this.containerEl.children[1];
     container.empty();
     container.addClass("second-brain-sidebar");
 
-    // Title
     container.createEl("h4", { text: "Second Brain Search" });
 
-    // Search input
     const searchRow = container.createDiv("second-brain-search-row");
     const input = searchRow.createEl("input", {
       type: "text",
@@ -89,7 +77,6 @@ class SecondBrainSidebarView extends ItemView {
       cls: "second-brain-btn",
     });
 
-    // Results container
     const results = container.createDiv("second-brain-results");
 
     const doSearch = async () => {
@@ -127,9 +114,7 @@ class SecondBrainSidebarView extends ItemView {
     };
 
     btn.addEventListener("click", doSearch);
-    input.addEventListener("keydown", (e) => {
-      if (e.key === "Enter") doSearch();
-    });
+    input.addEventListener("keydown", (e) => { if (e.key === "Enter") doSearch(); });
   }
 }
 
@@ -145,9 +130,9 @@ function chunkText(text: string, maxChars: number, overlapChars: number): string
     let end = start + maxChars;
 
     if (end < text.length) {
-      const lastPeriod = text.lastIndexOf(".", end);
+      const lastPeriod  = text.lastIndexOf(".", end);
       const lastNewline = text.lastIndexOf("\n", end);
-      const breakPoint = Math.max(lastPeriod, lastNewline);
+      const breakPoint  = Math.max(lastPeriod, lastNewline);
       if (breakPoint > start + maxChars / 2) end = breakPoint + 1;
     }
 
@@ -168,16 +153,14 @@ export default class SecondBrainPlugin extends Plugin {
   async onload() {
     await this.loadSettings();
 
-    // Status bar
     if (this.settings.showSyncStatus) {
       this.statusBar = this.addStatusBarItem();
       this.updateStatusBar();
     }
 
-    // Sidebar view
+    // FIX 1: register view but do NOT detach in onunload
     this.registerView(SIDEBAR_VIEW_TYPE, (leaf) => new SecondBrainSidebarView(leaf, this));
 
-    // Ribbon icons
     this.addRibbonIcon("brain", "Sync current note to Second Brain", () => {
       this.syncActiveNote();
     });
@@ -186,7 +169,6 @@ export default class SecondBrainPlugin extends Plugin {
       this.activateSidebar();
     });
 
-    // Commands
     this.addCommand({
       id: "sync-current-note",
       name: "Sync current note to Second Brain",
@@ -197,7 +179,7 @@ export default class SecondBrainPlugin extends Plugin {
 
     this.addCommand({
       id: "sync-all-tagged",
-      name: "Sync all tagged notes to Second Brain",
+      name: "Sync all notes to Second Brain",
       callback: () => this.syncAllTagged(),
     });
 
@@ -207,7 +189,6 @@ export default class SecondBrainPlugin extends Plugin {
       callback: () => this.activateSidebar(),
     });
 
-    // Auto-sync on save
     if (this.settings.autoSync) {
       this.registerEvent(
         this.app.vault.on("modify", async (file) => {
@@ -218,26 +199,25 @@ export default class SecondBrainPlugin extends Plugin {
       );
     }
 
-    // Settings tab
     this.addSettingTab(new SecondBrainSettingTab(this.app, this));
   }
 
-  onunload() {
-    this.app.workspace.detachLeavesOfType(SIDEBAR_VIEW_TYPE);
-  }
+  // FIX 1: removed onunload that called detachLeavesOfType
+  // Obsidian handles leaf lifecycle automatically
 
   // ── Sync methods ────────────────────────────────────────────────────────────
 
   async syncActiveNote() {
     const file = this.app.workspace.getActiveFile();
-    if (!file) {
-      new Notice("No active note open");
-      return;
-    }
+    if (!file) { new Notice("No active note open"); return; }
     await this.syncFile(file);
   }
 
   async syncIfTagged(file: TFile) {
+    if (this.settings.syncMode === "all") {
+      await this.syncFile(file);
+      return;
+    }
     const cache = this.app.metadataCache.getFileCache(file);
     const tags: string[] = cache?.frontmatter?.tags ?? [];
     if (!tags.includes(this.settings.syncTag)) return;
@@ -264,13 +244,11 @@ export default class SecondBrainPlugin extends Plugin {
     }
 
     new Notice(`Syncing ${tagged.length} notes...`);
-    let synced = 0;
-    let failed = 0;
+    let synced = 0, failed = 0;
 
     for (const file of tagged) {
       const ok = await this.syncFile(file, true);
-      if (ok) synced++;
-      else failed++;
+      if (ok) synced++; else failed++;
       await new Promise((r) => setTimeout(r, 300));
     }
 
@@ -288,12 +266,10 @@ export default class SecondBrainPlugin extends Plugin {
     const cache = this.app.metadataCache.getFileCache(file);
     const frontmatter = cache?.frontmatter ?? {};
 
-    // Strip frontmatter before storing
     const body = raw.replace(/^---[\s\S]*?---\n?/, "").trim();
     const title = file.basename;
     const noteTags: string[] = frontmatter.tags ?? [];
 
-    // Chunk if needed
     const fullContent = `${title}\n\n${body}`;
     const chunks = chunkText(fullContent, this.settings.chunkSize, this.settings.chunkOverlap);
 
@@ -321,7 +297,6 @@ export default class SecondBrainPlugin extends Plugin {
           return false;
         }
 
-        // Small delay between chunks
         if (i < chunks.length - 1) await new Promise((r) => setTimeout(r, 200));
       }
 
@@ -353,6 +328,7 @@ export default class SecondBrainPlugin extends Plugin {
       await leaf.setViewState({ type: SIDEBAR_VIEW_TYPE, active: true });
     }
 
+    // FIX 2: revealLeaf is fine since minAppVersion is now 1.7.2 in manifest
     workspace.revealLeaf(leaf);
   }
 
@@ -402,10 +378,12 @@ class SecondBrainSettingTab extends PluginSettingTab {
   display(): void {
     const { containerEl } = this;
     containerEl.empty();
-    containerEl.createEl("h2", { text: "Second Brain Settings" });
+
+    // FIX 3: use Setting.setHeading() for all section headers instead of createEl("h2/h3")
+    new Setting(containerEl).setName("Second Brain").setHeading();
 
     // ── Connection ──────────────────────────────────────────────────────────
-    containerEl.createEl("h3", { text: "Connection" });
+    new Setting(containerEl).setName("Connection").setHeading();
 
     new Setting(containerEl)
       .setName("Worker URL")
@@ -435,7 +413,6 @@ class SecondBrainSettingTab extends PluginSettingTab {
         return text;
       });
 
-    // Test connection button
     new Setting(containerEl)
       .setName("Test connection")
       .setDesc("Verify your Worker URL and token are correct")
@@ -464,7 +441,7 @@ class SecondBrainSettingTab extends PluginSettingTab {
       );
 
     // ── Sync behaviour ──────────────────────────────────────────────────────
-    containerEl.createEl("h3", { text: "Sync behaviour" });
+    new Setting(containerEl).setName("Sync behaviour").setHeading();
 
     new Setting(containerEl)
       .setName("Sync mode")
@@ -511,11 +488,10 @@ class SecondBrainSettingTab extends PluginSettingTab {
       );
 
     // ── Chunking ────────────────────────────────────────────────────────────
-    containerEl.createEl("h3", { text: "Chunking" });
-    containerEl.createEl("p", {
-      text: "Long notes are split into overlapping segments so each part gets a clean embedding. Short notes are stored as-is.",
-      cls: "setting-item-description",
-    });
+    new Setting(containerEl)
+      .setName("Chunking")
+      .setDesc("Long notes are split into overlapping segments so each part gets a clean embedding. Short notes are stored as-is.")
+      .setHeading();
 
     new Setting(containerEl)
       .setName("Chunk size (characters)")
@@ -546,7 +522,7 @@ class SecondBrainSettingTab extends PluginSettingTab {
       );
 
     // ── Display ─────────────────────────────────────────────────────────────
-    containerEl.createEl("h3", { text: "Display" });
+    new Setting(containerEl).setName("Display").setHeading();
 
     new Setting(containerEl)
       .setName("Show sync status in status bar")
@@ -560,8 +536,8 @@ class SecondBrainSettingTab extends PluginSettingTab {
           })
       );
 
-    // ── Sync now ────────────────────────────────────────────────────────────
-    containerEl.createEl("h3", { text: "Actions" });
+    // ── Actions ─────────────────────────────────────────────────────────────
+    new Setting(containerEl).setName("Actions").setHeading();
 
     new Setting(containerEl)
       .setName("Sync now")
