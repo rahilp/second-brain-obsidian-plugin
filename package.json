@@ -1,0 +1,16 @@
+{
+  "name": "second-brain-sync",
+  "version": "1.0.0",
+  "description": "Obsidian plugin to sync notes to your Second Brain MCP server",
+  "main": "main.js",
+  "scripts": {
+    "build": "npx esbuild main.ts --bundle --external:obsidian --outfile=main.js --platform=node --target=es2018",
+    "dev": "npx esbuild main.ts --bundle --external:obsidian --outfile=main.js --platform=node --target=es2018 --watch"
+  },
+  "devDependencies": {
+    "@types/node": "^18.0.0",
+    "esbuild": "^0.20.0",
+    "obsidian": "latest",
+    "typescript": "^5.0.0"
+  }
+}
