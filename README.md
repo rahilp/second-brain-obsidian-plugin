@@ -41,9 +41,10 @@ npm run build
 # Settings → Community Plugins → toggle on "Second Brain Sync"
 ```
 
-### From Obsidian Community Plugins (coming soon)
+### From Obsidian Community Plugins
 
 Search for "Second Brain Sync" in Settings → Community Plugins → Browse.
+[Second Brain Sync in Obsidian Community](https://community.obsidian.md/plugins/second-brain-sync0
 
 ---
 
