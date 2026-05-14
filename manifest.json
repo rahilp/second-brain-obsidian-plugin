@@ -1,7 +1,7 @@
 {
   "id": "second-brain-sync",
   "name": "Second Brain Sync",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "minAppVersion": "1.4.0",
   "description": "Sync your notes to your self-hosted Second Brain MCP server on Cloudflare Workers.",
   "author": "Rahil Pirani",
