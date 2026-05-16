@@ -7,8 +7,6 @@ import {
   Setting,
   Notice,
   TFile,
-  ItemView,
-  WorkspaceLeaf,
   requestUrl,
 } from "obsidian";
 
@@ -22,6 +20,7 @@ interface SecondBrainSettings {
   syncMode: SyncMode;
   syncTag: string;
   autoSync: boolean;
+  autoSyncDelay: number;
   chunkSize: number;
   chunkOverlap: number;
   showSyncStatus: boolean;
@@ -34,89 +33,12 @@ const DEFAULT_SETTINGS: SecondBrainSettings = {
   syncMode: "tagged",
   syncTag: "brain",
   autoSync: false,
+  autoSyncDelay: 5000,
   chunkSize: 1600,
   chunkOverlap: 200,
   showSyncStatus: true,
   lastSyncTime: null,
 };
-
-// ─── Sidebar view ─────────────────────────────────────────────────────────────
-
-const SIDEBAR_VIEW_TYPE = "second-brain-search";
-
-class SecondBrainSidebarView extends ItemView {
-  plugin: SecondBrainPlugin;
-
-  constructor(leaf: WorkspaceLeaf, plugin: SecondBrainPlugin) {
-    super(leaf);
-    this.plugin = plugin;
-  }
-
-  getViewType() { return SIDEBAR_VIEW_TYPE; }
-  getDisplayText() { return "Second Brain"; }
-  getIcon() { return "brain"; }
-
-  async onOpen() { this.render(); }
-
-  render() {
-    const container = this.containerEl.children[1];
-    container.empty();
-    container.addClass("second-brain-sidebar");
-
-    container.createEl("h4", { text: "Second Brain Search" });
-
-    const searchRow = container.createDiv("second-brain-search-row");
-    const input = searchRow.createEl("input", {
-      type: "text",
-      placeholder: "Search your brain...",
-      cls: "second-brain-input",
-    });
-
-    const btn = searchRow.createEl("button", {
-      text: "Search",
-      cls: "second-brain-btn",
-    });
-
-    const results = container.createDiv("second-brain-results");
-
-    const doSearch = async () => {
-      const query = input.value.trim();
-      if (!query) return;
-
-      results.empty();
-      results.createEl("p", { text: "Searching...", cls: "second-brain-searching" });
-
-      try {
-        const response = await requestUrl({
-          url: `${this.plugin.settings.workerUrl}/search?q=${encodeURIComponent(query)}`,
-          headers: { Authorization: `Bearer ${this.plugin.settings.authToken}` },
-        });
-
-        results.empty();
-
-        if (!response.json?.results?.length) {
-          results.createEl("p", { text: "Nothing found.", cls: "second-brain-empty" });
-          return;
-        }
-
-        for (const item of response.json.results) {
-          const card = results.createDiv("second-brain-card");
-          card.createEl("p", { text: item.content.slice(0, 200) + (item.content.length > 200 ? "..." : "") });
-          const meta = card.createDiv("second-brain-meta");
-          meta.createEl("span", { text: item.date });
-          meta.createEl("span", { text: item.source });
-          if (item.score) meta.createEl("span", { text: `${item.score}% match` });
-        }
-      } catch (e) {
-        results.empty();
-        results.createEl("p", { text: "Search failed. Check your Worker URL and token.", cls: "second-brain-error" });
-      }
-    };
-
-    btn.addEventListener("click", doSearch);
-    input.addEventListener("keydown", (e) => { if (e.key === "Enter") doSearch(); });
-  }
-}
 
 // ─── Chunking ─────────────────────────────────────────────────────────────────
 
@@ -149,6 +71,8 @@ function chunkText(text: string, maxChars: number, overlapChars: number): string
 export default class SecondBrainPlugin extends Plugin {
   settings: SecondBrainSettings;
   statusBar: HTMLElement | null = null;
+  debounceTimers: Map<string, NodeJS.Timeout> = new Map();
+  syncingFiles: Set<string> = new Set();
 
   async onload() {
     await this.loadSettings();
@@ -158,15 +82,8 @@ export default class SecondBrainPlugin extends Plugin {
       this.updateStatusBar();
     }
 
-    // FIX 1: register view but do NOT detach in onunload
-    this.registerView(SIDEBAR_VIEW_TYPE, (leaf) => new SecondBrainSidebarView(leaf, this));
-
     this.addRibbonIcon("brain", "Sync current note to Second Brain", () => {
       this.syncActiveNote();
-    });
-
-    this.addRibbonIcon("search", "Search Second Brain", () => {
-      this.activateSidebar();
     });
 
     this.addCommand({
@@ -183,17 +100,11 @@ export default class SecondBrainPlugin extends Plugin {
       callback: () => this.syncAllTagged(),
     });
 
-    this.addCommand({
-      id: "open-search",
-      name: "Open Second Brain search",
-      callback: () => this.activateSidebar(),
-    });
-
     if (this.settings.autoSync) {
       this.registerEvent(
         this.app.vault.on("modify", async (file) => {
           if (file instanceof TFile && file.extension === "md") {
-            await this.syncIfTagged(file);
+            await this.debouncedSyncIfTagged(file);
           }
         })
       );
@@ -213,15 +124,32 @@ export default class SecondBrainPlugin extends Plugin {
     await this.syncFile(file);
   }
 
+  async debouncedSyncIfTagged(file: TFile) {
+    // If we're currently syncing this file, ignore this modify event
+    if (this.syncingFiles.has(file.path)) return;
+
+    // Clear any existing timer for this file
+    const existingTimer = this.debounceTimers.get(file.path);
+    if (existingTimer) clearTimeout(existingTimer);
+
+    // Set a new timer
+    const timer = setTimeout(async () => {
+      this.debounceTimers.delete(file.path);
+      await this.syncIfTagged(file);
+    }, this.settings.autoSyncDelay);
+
+    this.debounceTimers.set(file.path, timer);
+  }
+
   async syncIfTagged(file: TFile) {
     if (this.settings.syncMode === "all") {
-      await this.syncFile(file);
+      await this.syncFile(file, true);
       return;
     }
     const cache = this.app.metadataCache.getFileCache(file);
     const tags: string[] = cache?.frontmatter?.tags ?? [];
     if (!tags.includes(this.settings.syncTag)) return;
-    await this.syncFile(file);
+    await this.syncFile(file, true);
   }
 
   async syncAllTagged() {
@@ -262,27 +190,33 @@ export default class SecondBrainPlugin extends Plugin {
   async syncFile(file: TFile, silent = false): Promise<boolean> {
     if (!this.validateSettings()) return false;
 
-    const raw = await this.app.vault.read(file);
-    const cache = this.app.metadataCache.getFileCache(file);
-    const frontmatter = cache?.frontmatter ?? {};
-
-    const body = raw.replace(/^---[\s\S]*?---\n?/, "").trim();
-    const title = file.basename;
-    const noteTags: string[] = frontmatter.tags ?? [];
-
-    const fullContent = `${title}\n\n${body}`;
-    const chunks = chunkText(fullContent, this.settings.chunkSize, this.settings.chunkOverlap);
+    // Prevent duplicate syncs
+    if (this.syncingFiles.has(file.path)) return true;
+    this.syncingFiles.add(file.path);
 
     try {
-      for (let i = 0; i < chunks.length; i++) {
+      const raw = await this.app.vault.read(file);
+      const cache = this.app.metadataCache.getFileCache(file);
+      const frontmatter = cache?.frontmatter ?? {};
+
+      const body = raw.replace(/^---[\s\S]*?---\n?/, "").trim();
+      const title = file.basename;
+      const noteTags: string[] = frontmatter.tags ?? [];
+      const existingId = frontmatter["second-brain-id"] as string | undefined;
+
+      const fullContent = `${title}\n\n${body}`;
+      const chunks = chunkText(fullContent, this.settings.chunkSize, this.settings.chunkOverlap);
+
+      // If we have an existing ID, use append; otherwise use capture
+      if (existingId) {
+        // Append mode: send full content as an addition
         const payload: Record<string, unknown> = {
-          content: chunks.length > 1 ? `${chunks[i]} [chunk ${i + 1}/${chunks.length}]` : chunks[i],
-          source: "obsidian",
-          tags: [...noteTags, "obsidian", file.parent?.name ?? ""].filter(Boolean),
+          id: existingId,
+          addition: fullContent,
         };
 
         const response = await requestUrl({
-          url: `${this.settings.workerUrl}/capture`,
+          url: `${this.settings.workerUrl}/append`,
           method: "POST",
           headers: {
             Authorization: `Bearer ${this.settings.authToken}`,
@@ -293,43 +227,86 @@ export default class SecondBrainPlugin extends Plugin {
         });
 
         if (response.status !== 200) {
-          if (!silent) new Notice(`Second Brain error: ${response.json?.error ?? response.status}`);
+          if (!silent) {
+            const errorMsg = response.json?.error ?? `Server returned ${response.status}`;
+            new Notice(`Second Brain error: ${errorMsg}`);
+          }
           return false;
         }
 
-        if (i < chunks.length - 1) await new Promise((r) => setTimeout(r, 200));
+        this.settings.lastSyncTime = Date.now();
+        await this.saveSettings();
+        this.updateStatusBar();
+
+        if (!silent) {
+          new Notice(`✓ Updated "${title}" in Second Brain`);
+        }
+
+        return true;
+      } else {
+        // Capture mode: create new entry
+        let capturedId: string | undefined;
+
+        for (let i = 0; i < chunks.length; i++) {
+          const payload: Record<string, unknown> = {
+            content: chunks.length > 1 ? `${chunks[i]} [chunk ${i + 1}/${chunks.length}]` : chunks[i],
+            source: "obsidian",
+            tags: [...noteTags, "obsidian", file.parent?.name ?? ""].filter(Boolean),
+          };
+
+          const response = await requestUrl({
+            url: `${this.settings.workerUrl}/capture`,
+            method: "POST",
+            headers: {
+              Authorization: `Bearer ${this.settings.authToken}`,
+              "Content-Type": "application/json",
+            },
+            body: JSON.stringify(payload),
+            throw: false,
+          });
+
+          if (response.status !== 200) {
+            if (!silent) {
+              const errorMsg = response.json?.error ?? `Server returned ${response.status}`;
+              new Notice(`Second Brain error: ${errorMsg}`);
+            }
+            return false;
+          }
+
+          // Store the ID from the first chunk
+          if (i === 0 && response.json?.id) {
+            capturedId = response.json.id;
+          }
+
+          if (i < chunks.length - 1) await new Promise((r) => setTimeout(r, 200));
+        }
+
+        // Save the ID to frontmatter if we got one
+        if (capturedId) {
+          await this.app.fileManager.processFrontMatter(file, (fm) => {
+            fm["second-brain-id"] = capturedId;
+          });
+        }
+
+        this.settings.lastSyncTime = Date.now();
+        await this.saveSettings();
+        this.updateStatusBar();
+
+        if (!silent) {
+          const chunkNote = chunks.length > 1 ? ` (${chunks.length} chunks)` : "";
+          new Notice(`✓ Saved "${title}" to Second Brain${chunkNote}`);
+        }
+
+        return true;
       }
-
-      this.settings.lastSyncTime = Date.now();
-      await this.saveSettings();
-      this.updateStatusBar();
-
-      if (!silent) {
-        const chunkNote = chunks.length > 1 ? ` (${chunks.length} chunks)` : "";
-        new Notice(`✓ Saved "${title}" to Second Brain${chunkNote}`);
-      }
-
-      return true;
     } catch (e) {
       if (!silent) new Notice("Second Brain: failed to connect to Worker");
       console.error("Second Brain sync error:", e);
       return false;
+    } finally {
+      // Always remove from syncing set
+      this.syncingFiles.delete(file.path);
     }
-  }
-
-  // ── Sidebar ─────────────────────────────────────────────────────────────────
-
-  async activateSidebar() {
-    const { workspace } = this.app;
-    let leaf = workspace.getLeavesOfType(SIDEBAR_VIEW_TYPE)[0];
-
-    if (!leaf) {
-      leaf = workspace.getRightLeaf(false)!;
-      await leaf.setViewState({ type: SIDEBAR_VIEW_TYPE, active: true });
-    }
-
-    // FIX 2: revealLeaf is fine since minAppVersion is now 1.7.2 in manifest
-    workspace.revealLeaf(leaf);
   }
 
   // ── Helpers ─────────────────────────────────────────────────────────────────
@@ -484,8 +461,25 @@ class SecondBrainSettingTab extends PluginSettingTab {
           .onChange(async (value) => {
             this.plugin.settings.autoSync = value;
             await this.plugin.saveSettings();
+            this.display();
           })
       );
+
+    if (this.plugin.settings.autoSync) {
+      new Setting(containerEl)
+        .setName("Auto-sync delay (seconds)")
+        .setDesc("Wait this long after you stop typing before syncing. Default: 5 seconds")
+        .addSlider((slider) =>
+          slider
+            .setLimits(3, 30, 1)
+            .setValue(this.plugin.settings.autoSyncDelay / 1000)
+            .setDynamicTooltip()
+            .onChange(async (value) => {
+              this.plugin.settings.autoSyncDelay = value * 1000;
+              await this.plugin.saveSettings();
+            })
+        );
+    }
 
     // ── Chunking ────────────────────────────────────────────────────────────
     new Setting(containerEl)

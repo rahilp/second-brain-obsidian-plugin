@@ -29,82 +29,11 @@ var DEFAULT_SETTINGS = {
   syncMode: "tagged",
   syncTag: "brain",
   autoSync: false,
+  autoSyncDelay: 5e3,
   chunkSize: 1600,
   chunkOverlap: 200,
   showSyncStatus: true,
   lastSyncTime: null
-};
-var SIDEBAR_VIEW_TYPE = "second-brain-search";
-var SecondBrainSidebarView = class extends import_obsidian.ItemView {
-  constructor(leaf, plugin) {
-    super(leaf);
-    this.plugin = plugin;
-  }
-  getViewType() {
-    return SIDEBAR_VIEW_TYPE;
-  }
-  getDisplayText() {
-    return "Second Brain";
-  }
-  getIcon() {
-    return "brain";
-  }
-  async onOpen() {
-    this.render();
-  }
-  render() {
-    const container = this.containerEl.children[1];
-    container.empty();
-    container.addClass("second-brain-sidebar");
-    container.createEl("h4", { text: "Second Brain Search" });
-    const searchRow = container.createDiv("second-brain-search-row");
-    const input = searchRow.createEl("input", {
-      type: "text",
-      placeholder: "Search your brain...",
-      cls: "second-brain-input"
-    });
-    const btn = searchRow.createEl("button", {
-      text: "Search",
-      cls: "second-brain-btn"
-    });
-    const results = container.createDiv("second-brain-results");
-    const doSearch = async () => {
-      var _a, _b;
-      const query = input.value.trim();
-      if (!query)
-        return;
-      results.empty();
-      results.createEl("p", { text: "Searching...", cls: "second-brain-searching" });
-      try {
-        const response = await (0, import_obsidian.requestUrl)({
-          url: `${this.plugin.settings.workerUrl}/search?q=${encodeURIComponent(query)}`,
-          headers: { Authorization: `Bearer ${this.plugin.settings.authToken}` }
-        });
-        results.empty();
-        if (!((_b = (_a = response.json) == null ? void 0 : _a.results) == null ? void 0 : _b.length)) {
-          results.createEl("p", { text: "Nothing found.", cls: "second-brain-empty" });
-          return;
-        }
-        for (const item of response.json.results) {
-          const card = results.createDiv("second-brain-card");
-          card.createEl("p", { text: item.content.slice(0, 200) + (item.content.length > 200 ? "..." : "") });
-          const meta = card.createDiv("second-brain-meta");
-          meta.createEl("span", { text: item.date });
-          meta.createEl("span", { text: item.source });
-          if (item.score)
-            meta.createEl("span", { text: `${item.score}% match` });
-        }
-      } catch (e) {
-        results.empty();
-        results.createEl("p", { text: "Search failed. Check your Worker URL and token.", cls: "second-brain-error" });
-      }
-    };
-    btn.addEventListener("click", doSearch);
-    input.addEventListener("keydown", (e) => {
-      if (e.key === "Enter")
-        doSearch();
-    });
-  }
 };
 function chunkText(text, maxChars, overlapChars) {
   if (text.length <= maxChars)
@@ -131,6 +60,8 @@ var SecondBrainPlugin = class extends import_obsidian.Plugin {
   constructor() {
     super(...arguments);
     this.statusBar = null;
+    this.debounceTimers = /* @__PURE__ */ new Map();
+    this.syncingFiles = /* @__PURE__ */ new Set();
   }
   async onload() {
     await this.loadSettings();
@@ -138,12 +69,8 @@ var SecondBrainPlugin = class extends import_obsidian.Plugin {
       this.statusBar = this.addStatusBarItem();
       this.updateStatusBar();
     }
-    this.registerView(SIDEBAR_VIEW_TYPE, (leaf) => new SecondBrainSidebarView(leaf, this));
     this.addRibbonIcon("brain", "Sync current note to Second Brain", () => {
       this.syncActiveNote();
-    });
-    this.addRibbonIcon("search", "Search Second Brain", () => {
-      this.activateSidebar();
     });
     this.addCommand({
       id: "sync-current-note",
@@ -157,16 +84,11 @@ var SecondBrainPlugin = class extends import_obsidian.Plugin {
       name: "Sync all notes to Second Brain",
       callback: () => this.syncAllTagged()
     });
-    this.addCommand({
-      id: "open-search",
-      name: "Open Second Brain search",
-      callback: () => this.activateSidebar()
-    });
     if (this.settings.autoSync) {
       this.registerEvent(
         this.app.vault.on("modify", async (file) => {
           if (file instanceof import_obsidian.TFile && file.extension === "md") {
-            await this.syncIfTagged(file);
+            await this.debouncedSyncIfTagged(file);
           }
         })
       );
@@ -184,17 +106,29 @@ var SecondBrainPlugin = class extends import_obsidian.Plugin {
     }
     await this.syncFile(file);
   }
+  async debouncedSyncIfTagged(file) {
+    if (this.syncingFiles.has(file.path))
+      return;
+    const existingTimer = this.debounceTimers.get(file.path);
+    if (existingTimer)
+      clearTimeout(existingTimer);
+    const timer = setTimeout(async () => {
+      this.debounceTimers.delete(file.path);
+      await this.syncIfTagged(file);
+    }, this.settings.autoSyncDelay);
+    this.debounceTimers.set(file.path, timer);
+  }
   async syncIfTagged(file) {
     var _a, _b;
     if (this.settings.syncMode === "all") {
-      await this.syncFile(file);
+      await this.syncFile(file, true);
       return;
     }
     const cache = this.app.metadataCache.getFileCache(file);
     const tags = (_b = (_a = cache == null ? void 0 : cache.frontmatter) == null ? void 0 : _a.tags) != null ? _b : [];
     if (!tags.includes(this.settings.syncTag))
       return;
-    await this.syncFile(file);
+    await this.syncFile(file, true);
   }
   async syncAllTagged() {
     if (!this.validateSettings())
@@ -226,28 +160,31 @@ var SecondBrainPlugin = class extends import_obsidian.Plugin {
     new import_obsidian.Notice(`Second Brain: ${synced} synced${failed ? `, ${failed} failed` : ""}`);
   }
   async syncFile(file, silent = false) {
-    var _a, _b, _c, _d, _e, _f;
+    var _a, _b, _c, _d, _e, _f, _g, _h, _i;
     if (!this.validateSettings())
       return false;
-    const raw = await this.app.vault.read(file);
-    const cache = this.app.metadataCache.getFileCache(file);
-    const frontmatter = (_a = cache == null ? void 0 : cache.frontmatter) != null ? _a : {};
-    const body = raw.replace(/^---[\s\S]*?---\n?/, "").trim();
-    const title = file.basename;
-    const noteTags = (_b = frontmatter.tags) != null ? _b : [];
-    const fullContent = `${title}
+    if (this.syncingFiles.has(file.path))
+      return true;
+    this.syncingFiles.add(file.path);
+    try {
+      const raw = await this.app.vault.read(file);
+      const cache = this.app.metadataCache.getFileCache(file);
+      const frontmatter = (_a = cache == null ? void 0 : cache.frontmatter) != null ? _a : {};
+      const body = raw.replace(/^---[\s\S]*?---\n?/, "").trim();
+      const title = file.basename;
+      const noteTags = (_b = frontmatter.tags) != null ? _b : [];
+      const existingId = frontmatter["second-brain-id"];
+      const fullContent = `${title}
 
 ${body}`;
-    const chunks = chunkText(fullContent, this.settings.chunkSize, this.settings.chunkOverlap);
-    try {
-      for (let i = 0; i < chunks.length; i++) {
+      const chunks = chunkText(fullContent, this.settings.chunkSize, this.settings.chunkOverlap);
+      if (existingId) {
         const payload = {
-          content: chunks.length > 1 ? `${chunks[i]} [chunk ${i + 1}/${chunks.length}]` : chunks[i],
-          source: "obsidian",
-          tags: [...noteTags, "obsidian", (_d = (_c = file.parent) == null ? void 0 : _c.name) != null ? _d : ""].filter(Boolean)
+          id: existingId,
+          addition: fullContent
         };
         const response = await (0, import_obsidian.requestUrl)({
-          url: `${this.settings.workerUrl}/capture`,
+          url: `${this.settings.workerUrl}/append`,
           method: "POST",
           headers: {
             Authorization: `Bearer ${this.settings.authToken}`,
@@ -257,37 +194,72 @@ ${body}`;
           throw: false
         });
         if (response.status !== 200) {
-          if (!silent)
-            new import_obsidian.Notice(`Second Brain error: ${(_f = (_e = response.json) == null ? void 0 : _e.error) != null ? _f : response.status}`);
+          if (!silent) {
+            const errorMsg = (_d = (_c = response.json) == null ? void 0 : _c.error) != null ? _d : `Server returned ${response.status}`;
+            new import_obsidian.Notice(`Second Brain error: ${errorMsg}`);
+          }
           return false;
         }
-        if (i < chunks.length - 1)
-          await new Promise((r) => setTimeout(r, 200));
+        this.settings.lastSyncTime = Date.now();
+        await this.saveSettings();
+        this.updateStatusBar();
+        if (!silent) {
+          new import_obsidian.Notice(`\u2713 Updated "${title}" in Second Brain`);
+        }
+        return true;
+      } else {
+        let capturedId;
+        for (let i = 0; i < chunks.length; i++) {
+          const payload = {
+            content: chunks.length > 1 ? `${chunks[i]} [chunk ${i + 1}/${chunks.length}]` : chunks[i],
+            source: "obsidian",
+            tags: [...noteTags, "obsidian", (_f = (_e = file.parent) == null ? void 0 : _e.name) != null ? _f : ""].filter(Boolean)
+          };
+          const response = await (0, import_obsidian.requestUrl)({
+            url: `${this.settings.workerUrl}/capture`,
+            method: "POST",
+            headers: {
+              Authorization: `Bearer ${this.settings.authToken}`,
+              "Content-Type": "application/json"
+            },
+            body: JSON.stringify(payload),
+            throw: false
+          });
+          if (response.status !== 200) {
+            if (!silent) {
+              const errorMsg = (_h = (_g = response.json) == null ? void 0 : _g.error) != null ? _h : `Server returned ${response.status}`;
+              new import_obsidian.Notice(`Second Brain error: ${errorMsg}`);
+            }
+            return false;
+          }
+          if (i === 0 && ((_i = response.json) == null ? void 0 : _i.id)) {
+            capturedId = response.json.id;
+          }
+          if (i < chunks.length - 1)
+            await new Promise((r) => setTimeout(r, 200));
+        }
+        if (capturedId) {
+          await this.app.fileManager.processFrontMatter(file, (fm) => {
+            fm["second-brain-id"] = capturedId;
+          });
+        }
+        this.settings.lastSyncTime = Date.now();
+        await this.saveSettings();
+        this.updateStatusBar();
+        if (!silent) {
+          const chunkNote = chunks.length > 1 ? ` (${chunks.length} chunks)` : "";
+          new import_obsidian.Notice(`\u2713 Saved "${title}" to Second Brain${chunkNote}`);
+        }
+        return true;
       }
-      this.settings.lastSyncTime = Date.now();
-      await this.saveSettings();
-      this.updateStatusBar();
-      if (!silent) {
-        const chunkNote = chunks.length > 1 ? ` (${chunks.length} chunks)` : "";
-        new import_obsidian.Notice(`\u2713 Saved "${title}" to Second Brain${chunkNote}`);
-      }
-      return true;
     } catch (e) {
       if (!silent)
         new import_obsidian.Notice("Second Brain: failed to connect to Worker");
       console.error("Second Brain sync error:", e);
       return false;
+    } finally {
+      this.syncingFiles.delete(file.path);
     }
-  }
-  // ── Sidebar ─────────────────────────────────────────────────────────────────
-  async activateSidebar() {
-    const { workspace } = this.app;
-    let leaf = workspace.getLeavesOfType(SIDEBAR_VIEW_TYPE)[0];
-    if (!leaf) {
-      leaf = workspace.getRightLeaf(false);
-      await leaf.setViewState({ type: SIDEBAR_VIEW_TYPE, active: true });
-    }
-    workspace.revealLeaf(leaf);
   }
   // ── Helpers ─────────────────────────────────────────────────────────────────
   validateSettings() {
@@ -384,8 +356,17 @@ var SecondBrainSettingTab = class extends import_obsidian.PluginSettingTab {
       (toggle) => toggle.setValue(this.plugin.settings.autoSync).onChange(async (value) => {
         this.plugin.settings.autoSync = value;
         await this.plugin.saveSettings();
+        this.display();
       })
     );
+    if (this.plugin.settings.autoSync) {
+      new import_obsidian.Setting(containerEl).setName("Auto-sync delay (seconds)").setDesc("Wait this long after you stop typing before syncing. Default: 5 seconds").addSlider(
+        (slider) => slider.setLimits(3, 30, 1).setValue(this.plugin.settings.autoSyncDelay / 1e3).setDynamicTooltip().onChange(async (value) => {
+          this.plugin.settings.autoSyncDelay = value * 1e3;
+          await this.plugin.saveSettings();
+        })
+      );
+    }
     new import_obsidian.Setting(containerEl).setName("Chunking").setDesc("Long notes are split into overlapping segments so each part gets a clean embedding. Short notes are stored as-is.").setHeading();
     new import_obsidian.Setting(containerEl).setName("Chunk size (characters)").setDesc("Maximum characters per chunk. Default: 1600 (~400 tokens)").addSlider(
       (slider) => slider.setLimits(400, 4e3, 100).setValue(this.plugin.settings.chunkSize).setDynamicTooltip().onChange(async (value) => {
