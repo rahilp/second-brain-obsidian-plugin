@@ -5,7 +5,8 @@
   "main": "main.js",
   "scripts": {
     "build": "npx esbuild main.ts --bundle --external:obsidian --outfile=main.js --platform=node --target=es2018",
-    "dev": "npx esbuild main.ts --bundle --external:obsidian --outfile=main.js --platform=node --target=es2018 --watch"
+    "dev": "npx esbuild main.ts --bundle --external:obsidian --outfile=main.js --platform=node --target=es2018 --watch",
+    "release": "git add . && git commit -m \"$VERSION\" && git push origin main && git tag $VERSION && git push origin $VERSION"
   },
   "devDependencies": {
     "@types/node": "^18.0.0",
