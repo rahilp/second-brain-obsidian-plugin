@@ -33,7 +33,12 @@ var DEFAULT_SETTINGS = {
   chunkSize: 1600,
   chunkOverlap: 200,
   showSyncStatus: true,
-  lastSyncTime: null
+  lastSyncTime: null,
+  importFolder: "_Second Brain/Inbox",
+  importTag: "obsidian-inbox",
+  importLimit: 20,
+  pullOnStartup: false,
+  importedIds: []
 };
 function chunkText(text, maxChars, overlapChars) {
   if (text.length <= maxChars)
@@ -62,6 +67,7 @@ var SecondBrainPlugin = class extends import_obsidian.Plugin {
     this.statusBar = null;
     this.debounceTimers = /* @__PURE__ */ new Map();
     this.syncingFiles = /* @__PURE__ */ new Set();
+    this.isImporting = false;
   }
   async onload() {
     await this.loadSettings();
@@ -84,6 +90,13 @@ var SecondBrainPlugin = class extends import_obsidian.Plugin {
       name: "Sync all notes to Second Brain",
       callback: () => this.syncAllTagged()
     });
+    this.addCommand({
+      id: "import-memories-from-second-brain",
+      name: "Import memories from Second Brain",
+      callback: async () => {
+        await this.importMemories(false);
+      }
+    });
     if (this.settings.autoSync) {
       this.registerEvent(
         this.app.vault.on("modify", async (file) => {
@@ -92,6 +105,14 @@ var SecondBrainPlugin = class extends import_obsidian.Plugin {
           }
         })
       );
+    }
+    if (this.settings.pullOnStartup) {
+      this.app.workspace.onLayoutReady(() => {
+        this.importMemories(true).catch((e) => {
+          console.error("Second Brain automatic import failed:", e);
+          new import_obsidian.Notice("Automatic memory import failed.");
+        });
+      });
     }
     this.addSettingTab(new SecondBrainSettingTab(this.app, this));
   }
@@ -283,6 +304,267 @@ ${body}`;
       this.statusBar.setText("Brain: never synced");
     }
   }
+  // ── Import helpers ─────────────────────────────────────────────────────────
+  normalizeWorkerUrl(url) {
+    return url.trim().replace(/\/+$/, "");
+  }
+  parseMemoryTags(tagsField) {
+    let rawTags = [];
+    if (Array.isArray(tagsField)) {
+      rawTags = tagsField.map((t) => typeof t === "string" ? t.trim() : "").filter(Boolean);
+    } else if (typeof tagsField === "string") {
+      const trimmed = tagsField.trim();
+      if (trimmed.startsWith("[") && trimmed.endsWith("]")) {
+        try {
+          const parsed = JSON.parse(trimmed);
+          if (Array.isArray(parsed)) {
+            rawTags = parsed.map((t) => typeof t === "string" ? t.trim() : "").filter(Boolean);
+          } else {
+            rawTags = [trimmed];
+          }
+        } catch (e) {
+          rawTags = trimmed.split(",").map((t) => t.trim()).filter(Boolean);
+        }
+      } else {
+        rawTags = trimmed.split(",").map((t) => t.trim()).filter(Boolean);
+      }
+    }
+    return Array.from(new Set(rawTags));
+  }
+  sanitizeFileName(input) {
+    if (!input || !input.trim())
+      return "Untitled Memory";
+    let clean = input.replace(/[\\/:*?"<>|]/g, " ").replace(/[\r\n]+/g, " ").replace(/\s+/g, " ").trim();
+    clean = clean.replace(/\.+$/, "").trim();
+    if (clean.length > 100) {
+      clean = clean.slice(0, 100).trim();
+    }
+    return clean || "Untitled Memory";
+  }
+  generateMemoryTitle(content, id) {
+    const lines = content.split("\n").map((l) => l.trim()).filter(Boolean);
+    let titleCandidate = "";
+    if (lines.length > 0) {
+      const firstLine = lines[0];
+      if (firstLine.startsWith("#")) {
+        titleCandidate = firstLine.replace(/^#+\s*/, "");
+      } else {
+        titleCandidate = content.replace(/[\r\n]+/g, " ").trim();
+        if (titleCandidate.length > 50) {
+          titleCandidate = titleCandidate.slice(0, 50);
+        }
+      }
+    }
+    const sanitized = this.sanitizeFileName(titleCandidate);
+    if (sanitized === "Untitled Memory") {
+      return `Memory-${id.slice(0, 8)}`;
+    }
+    return sanitized;
+  }
+  getAvailableFilePath(folderPath, title) {
+    const cleanFolder = folderPath.replace(/\/$/, "");
+    let basePath = `${cleanFolder}/${title}.md`;
+    let file = this.app.vault.getAbstractFileByPath((0, import_obsidian.normalizePath)(basePath));
+    if (!file) {
+      return (0, import_obsidian.normalizePath)(basePath);
+    }
+    let counter = 1;
+    while (file) {
+      basePath = `${cleanFolder}/${title} (${counter}).md`;
+      file = this.app.vault.getAbstractFileByPath((0, import_obsidian.normalizePath)(basePath));
+      counter++;
+    }
+    return (0, import_obsidian.normalizePath)(basePath);
+  }
+  async ensureFolderExists(folderPath) {
+    const normalized = (0, import_obsidian.normalizePath)(folderPath);
+    if (!normalized || normalized === "/" || normalized === ".")
+      return;
+    const parts = normalized.split("/");
+    let currentPath = "";
+    for (const part of parts) {
+      if (!part)
+        continue;
+      currentPath = currentPath ? `${currentPath}/${part}` : part;
+      const fileOrFolder = this.app.vault.getAbstractFileByPath(currentPath);
+      if (fileOrFolder) {
+        if (fileOrFolder instanceof import_obsidian.TFile) {
+          throw new Error(`Path "${currentPath}" exists but is a file, not a directory.`);
+        }
+      } else {
+        await this.app.vault.createFolder(currentPath);
+      }
+    }
+  }
+  async memoryAlreadyImported(memoryId) {
+    var _a, _b;
+    if ((_a = this.settings.importedIds) == null ? void 0 : _a.includes(memoryId)) {
+      return true;
+    }
+    const markdownFiles = this.app.vault.getMarkdownFiles();
+    for (const file of markdownFiles) {
+      const cache = this.app.metadataCache.getFileCache(file);
+      const extId = (_b = cache == null ? void 0 : cache.frontmatter) == null ? void 0 : _b["external_memory_id"];
+      if (extId === memoryId) {
+        if (!this.settings.importedIds.includes(memoryId)) {
+          this.settings.importedIds.push(memoryId);
+          await this.saveSettings();
+        }
+        return true;
+      }
+    }
+    return false;
+  }
+  async importMemories(silent = false) {
+    var _a, _b, _c, _d;
+    if (this.isImporting) {
+      if (!silent)
+        new import_obsidian.Notice("An import operation is already in progress.");
+      return;
+    }
+    if (!this.settings.workerUrl) {
+      if (!silent)
+        new import_obsidian.Notice("Worker URL is not configured.");
+      return;
+    }
+    if (!this.settings.authToken) {
+      if (!silent)
+        new import_obsidian.Notice("Auth token is not configured.");
+      return;
+    }
+    this.isImporting = true;
+    if (!silent)
+      new import_obsidian.Notice("Starting import from Second Brain...");
+    try {
+      const workerUrl = this.normalizeWorkerUrl(this.settings.workerUrl);
+      const authToken = this.settings.authToken;
+      const importLimit = typeof this.settings.importLimit === "number" && this.settings.importLimit >= 1 ? this.settings.importLimit : 20;
+      const importTag = ((_a = this.settings.importTag) == null ? void 0 : _a.trim()) || "obsidian-inbox";
+      const importFolder = ((_b = this.settings.importFolder) == null ? void 0 : _b.trim()) || "_Second Brain/Inbox";
+      const url = `${workerUrl}/list?n=${importLimit}&tag=${encodeURIComponent(importTag)}`;
+      const response = await (0, import_obsidian.requestUrl)({
+        url,
+        method: "GET",
+        headers: {
+          Authorization: `Bearer ${authToken}`,
+          Accept: "application/json"
+        },
+        throw: false
+      });
+      if (response.status !== 200) {
+        let errorMsg = `Server returned ${response.status}`;
+        if (response.status === 401) {
+          errorMsg = "Unauthorized. Please check your auth token.";
+        }
+        if (!silent)
+          new import_obsidian.Notice(`Second Brain import failed: ${errorMsg}`);
+        return;
+      }
+      const data = response.json;
+      let memories = [];
+      if (Array.isArray(data)) {
+        memories = data;
+      } else if (data && typeof data === "object") {
+        if (Array.isArray(data.items)) {
+          memories = data.items;
+        } else if (Array.isArray(data.entries)) {
+          memories = data.entries;
+        } else if (Array.isArray(data.memories)) {
+          memories = data.memories;
+        } else if (Array.isArray(data.data)) {
+          memories = data.data;
+        } else {
+          if (!silent)
+            new import_obsidian.Notice("Invalid response format: No array of memories found.");
+          return;
+        }
+      } else {
+        if (!silent)
+          new import_obsidian.Notice("Invalid response format: Response is not JSON.");
+        return;
+      }
+      let importedCount = 0;
+      let failedCount = 0;
+      let skippedCount = 0;
+      let settingsChanged = false;
+      await this.ensureFolderExists(importFolder);
+      for (const item of memories) {
+        const id = item == null ? void 0 : item.id;
+        const content = item == null ? void 0 : item.content;
+        if (!id || !content || typeof id !== "string" || typeof content !== "string") {
+          continue;
+        }
+        const rawTags = this.parseMemoryTags(item.tags);
+        if (importTag && !rawTags.includes(importTag)) {
+          skippedCount++;
+          continue;
+        }
+        const alreadyImported = await this.memoryAlreadyImported(id);
+        if (alreadyImported) {
+          skippedCount++;
+          continue;
+        }
+        try {
+          const title = this.generateMemoryTitle(content, id);
+          const path = this.getAvailableFilePath(importFolder, title);
+          const cleanId = id.replace(/"/g, '\\"');
+          const source = item.source && typeof item.source === "string" ? item.source.replace(/"/g, '\\"') : "external-memory";
+          const createdAt = item.created_at != null ? String(item.created_at).replace(/"/g, '\\"') : "";
+          const importedAt = (/* @__PURE__ */ new Date()).toISOString();
+          const tagsYaml = rawTags.length > 0 ? "\ntags:\n" + rawTags.map((t) => `  - ${t}`).join("\n") : "";
+          const firstLine = (_d = (_c = content.trim().split("\n")[0]) == null ? void 0 : _c.trim()) != null ? _d : "";
+          const startsWithSameHeading = firstLine.startsWith("#") && firstLine.replace(/^#+\s*/, "").trim() === title;
+          const frontmatter = `---
+external_memory_id: "${cleanId}"
+external_memory_source: "${source}"
+external_memory_created_at: "${createdAt}"
+imported_at: "${importedAt}"${tagsYaml}
+---`;
+          const body = startsWithSameHeading ? `
+
+${content}` : `
+
+# ${title}
+
+${content}`;
+          const fileContent = frontmatter + body;
+          await this.app.vault.create(path, fileContent);
+          if (!this.settings.importedIds.includes(id)) {
+            this.settings.importedIds.push(id);
+            settingsChanged = true;
+          }
+          importedCount++;
+        } catch (itemError) {
+          console.error(`Failed to import memory ID ${id}:`, itemError);
+          failedCount++;
+        }
+      }
+      if (settingsChanged) {
+        await this.saveSettings();
+      }
+      if (importedCount > 0) {
+        let msg = `Imported ${importedCount} memory/memories.`;
+        if (failedCount > 0) {
+          msg += ` ${failedCount} failed.`;
+        }
+        new import_obsidian.Notice(msg);
+      } else {
+        if (!silent) {
+          let msg = "No new memories to import.";
+          if (failedCount > 0) {
+            msg += ` ${failedCount} failed.`;
+          }
+          new import_obsidian.Notice(msg);
+        }
+      }
+    } catch (e) {
+      console.error("Import memories critical error:", e);
+      if (!silent)
+        new import_obsidian.Notice("Second Brain import failed: check console logs for details.");
+    } finally {
+      this.isImporting = false;
+    }
+  }
   async loadSettings() {
     this.settings = Object.assign({}, DEFAULT_SETTINGS, await this.loadData());
   }
@@ -296,6 +578,7 @@ var SecondBrainSettingTab = class extends import_obsidian.PluginSettingTab {
     this.plugin = plugin;
   }
   display() {
+    var _a, _b;
     const { containerEl } = this;
     containerEl.empty();
     new import_obsidian.Setting(containerEl).setName("Second Brain").setHeading();
@@ -378,6 +661,45 @@ var SecondBrainSettingTab = class extends import_obsidian.PluginSettingTab {
       (slider) => slider.setLimits(0, 500, 50).setValue(this.plugin.settings.chunkOverlap).setDynamicTooltip().onChange(async (value) => {
         this.plugin.settings.chunkOverlap = value;
         await this.plugin.saveSettings();
+      })
+    );
+    new import_obsidian.Setting(containerEl).setName("Import behavior").setHeading();
+    new import_obsidian.Setting(containerEl).setName("Import folder").setDesc("Folder where imported memories will be saved.").addText(
+      (text) => text.setPlaceholder("_Second Brain/Inbox").setValue(this.plugin.settings.importFolder).onChange(async (value) => {
+        this.plugin.settings.importFolder = value.trim() || "_Second Brain/Inbox";
+        await this.plugin.saveSettings();
+      })
+    );
+    new import_obsidian.Setting(containerEl).setName("Import tag").setDesc("Tag used to filter external memories to import.").addText(
+      (text) => text.setPlaceholder("obsidian-inbox").setValue(this.plugin.settings.importTag).onChange(async (value) => {
+        this.plugin.settings.importTag = value.trim() || "obsidian-inbox";
+        await this.plugin.saveSettings();
+      })
+    );
+    new import_obsidian.Setting(containerEl).setName("Import limit").setDesc("Maximum number of memories to fetch per import.").addText(
+      (text) => text.setPlaceholder("20").setValue(String(this.plugin.settings.importLimit)).onChange(async (value) => {
+        const parsed = parseInt(value.trim(), 10);
+        if (isNaN(parsed) || parsed < 1) {
+          new import_obsidian.Notice("Import limit must be a positive number");
+          text.setValue(String(this.plugin.settings.importLimit));
+          return;
+        }
+        this.plugin.settings.importLimit = parsed;
+        await this.plugin.saveSettings();
+      })
+    );
+    new import_obsidian.Setting(containerEl).setName("Pull/import on startup").setDesc("Automatically pull memories from your Second Brain when Obsidian starts.").addToggle(
+      (toggle) => toggle.setValue(this.plugin.settings.pullOnStartup).onChange(async (value) => {
+        this.plugin.settings.pullOnStartup = value;
+        await this.plugin.saveSettings();
+      })
+    );
+    new import_obsidian.Setting(containerEl).setName("Reset imported IDs cache").setDesc(`Clear the list of previously imported memory IDs. Currently contains ${(_b = (_a = this.plugin.settings.importedIds) == null ? void 0 : _a.length) != null ? _b : 0} ID(s).`).addButton(
+      (btn) => btn.setButtonText("Reset cache").setWarning().onClick(async () => {
+        this.plugin.settings.importedIds = [];
+        await this.plugin.saveSettings();
+        this.display();
+        new import_obsidian.Notice("Imported IDs cache has been reset");
       })
     );
     new import_obsidian.Setting(containerEl).setName("Display").setHeading();
