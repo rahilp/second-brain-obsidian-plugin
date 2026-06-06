@@ -141,9 +141,9 @@ var SecondBrainPlugin = class extends import_obsidian.Plugin {
     const existingTimer = this.debounceTimers.get(file.path);
     if (existingTimer)
       window.clearTimeout(existingTimer);
-    const timer = window.setTimeout(async () => {
+    const timer = window.setTimeout(() => {
       this.debounceTimers.delete(file.path);
-      await this.syncIfTagged(file);
+      void this.syncIfTagged(file);
     }, this.settings.autoSyncDelay);
     this.debounceTimers.set(file.path, timer);
   }
@@ -459,15 +459,14 @@ ${body}`;
       if (Array.isArray(data)) {
         memories = data;
       } else if (data && typeof data === "object") {
-        const obj = data;
-        if (Array.isArray(obj.items)) {
-          memories = obj.items;
-        } else if (Array.isArray(obj.entries)) {
-          memories = obj.entries;
-        } else if (Array.isArray(obj.memories)) {
-          memories = obj.memories;
-        } else if (Array.isArray(obj.data)) {
-          memories = obj.data;
+        if (Array.isArray(data.items)) {
+          memories = data.items;
+        } else if (Array.isArray(data.entries)) {
+          memories = data.entries;
+        } else if (Array.isArray(data.memories)) {
+          memories = data.memories;
+        } else if (Array.isArray(data.data)) {
+          memories = data.data;
         } else {
           if (!silent)
             new import_obsidian.Notice("Invalid response format: No array of memories found.");
@@ -574,6 +573,9 @@ var SecondBrainSettingTab = class extends import_obsidian.PluginSettingTab {
     this.plugin = plugin;
   }
   display() {
+    this.render();
+  }
+  render() {
     var _a, _b;
     const { containerEl } = this;
     containerEl.empty();
@@ -620,7 +622,7 @@ var SecondBrainSettingTab = class extends import_obsidian.PluginSettingTab {
       dropdown.addOption("tagged", "Tagged notes only").addOption("all", "All notes").setValue(this.plugin.settings.syncMode).onChange(async (value) => {
         this.plugin.settings.syncMode = value;
         await this.plugin.saveSettings();
-        this.display();
+        this.render();
       });
     });
     if (this.plugin.settings.syncMode === "tagged") {
@@ -635,7 +637,7 @@ var SecondBrainSettingTab = class extends import_obsidian.PluginSettingTab {
       (toggle) => toggle.setValue(this.plugin.settings.autoSync).onChange(async (value) => {
         this.plugin.settings.autoSync = value;
         await this.plugin.saveSettings();
-        this.display();
+        this.render();
       })
     );
     if (this.plugin.settings.autoSync) {
@@ -691,10 +693,10 @@ var SecondBrainSettingTab = class extends import_obsidian.PluginSettingTab {
       })
     );
     new import_obsidian.Setting(containerEl).setName("Reset imported IDs cache").setDesc(`Clear the list of previously imported memory IDs. Currently contains ${(_b = (_a = this.plugin.settings.importedIds) == null ? void 0 : _a.length) != null ? _b : 0} ID(s).`).addButton(
-      (btn) => btn.setButtonText("Reset cache").setDestructive().onClick(async () => {
+      (btn) => btn.setButtonText("Reset cache").onClick(async () => {
         this.plugin.settings.importedIds = [];
         await this.plugin.saveSettings();
-        this.display();
+        this.render();
         new import_obsidian.Notice("Imported IDs cache has been reset");
       })
     );
