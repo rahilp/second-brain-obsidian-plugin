@@ -77,12 +77,35 @@ function chunkText(text: string, maxChars: number, overlapChars: number): string
   return chunks.filter((c) => c.length > 0);
 }
 
+// ─── API types ────────────────────────────────────────────────────────────────
+
+interface ApiResponse {
+  ok?: boolean;
+  id?: string;
+  error?: string;
+}
+
+interface MemoryEntry {
+  id?: unknown;
+  content?: unknown;
+  tags?: unknown;
+  source?: unknown;
+  created_at?: unknown;
+}
+
+interface ListApiResponse {
+  items?: MemoryEntry[];
+  entries?: MemoryEntry[];
+  memories?: MemoryEntry[];
+  data?: MemoryEntry[];
+}
+
 // ─── Plugin ───────────────────────────────────────────────────────────────────
 
 export default class SecondBrainPlugin extends Plugin {
   settings: SecondBrainSettings;
   statusBar: HTMLElement | null = null;
-  // number (browser) rather than NodeJS.Timeout — we use activeWindow.setTimeout
+  // number (browser) rather than NodeJS.Timeout — we use window.setTimeout
   debounceTimers: Map<string, number> = new Map();
   syncingFiles: Set<string> = new Set();
   isImporting = false;
@@ -96,7 +119,7 @@ export default class SecondBrainPlugin extends Plugin {
     }
 
     this.addRibbonIcon("brain", "Sync current note to Second Brain", () => {
-      this.syncActiveNote();
+      void this.syncActiveNote();
     });
 
     // FIX: command names must not include the plugin name (rule 15)
@@ -104,7 +127,7 @@ export default class SecondBrainPlugin extends Plugin {
       id: "sync-current-note",
       name: "Sync current note",
       editorCallback: (_editor: Editor, view: MarkdownView) => {
-        this.syncFile(view.file!);
+        void this.syncFile(view.file!);
       },
     });
 
@@ -170,10 +193,9 @@ export default class SecondBrainPlugin extends Plugin {
     if (this.syncingFiles.has(file.path)) return;
 
     const existingTimer = this.debounceTimers.get(file.path);
-    if (existingTimer) clearTimeout(existingTimer);
+    if (existingTimer) window.clearTimeout(existingTimer);
 
-    // FIX: use activeWindow.setTimeout for popout window compatibility (rule 30)
-    const timer = activeWindow.setTimeout(async () => {
+    const timer = window.setTimeout(async () => {
       this.debounceTimers.delete(file.path);
       await this.syncIfTagged(file);
     }, this.settings.autoSyncDelay);
@@ -187,7 +209,7 @@ export default class SecondBrainPlugin extends Plugin {
       return;
     }
     const cache = this.app.metadataCache.getFileCache(file);
-    const frontmatterTags: string[] = cache?.frontmatter?.tags ?? [];
+    const frontmatterTags: string[] = (cache?.frontmatter?.tags as string[] | undefined) ?? [];
     // cache.tags includes inline tags (#brain in body); strip the leading #
     const inlineTags: string[] = (cache?.tags ?? []).map((t) => t.tag.replace(/^#/, ""));
     const allTags = [...frontmatterTags, ...inlineTags];
@@ -203,7 +225,7 @@ export default class SecondBrainPlugin extends Plugin {
       ? files
       : files.filter((f) => {
           const cache = this.app.metadataCache.getFileCache(f);
-          const tags: string[] = cache?.frontmatter?.tags ?? [];
+          const tags: string[] = (cache?.frontmatter?.tags as string[] | undefined) ?? [];
           return tags.includes(this.settings.syncTag);
         });
 
@@ -220,8 +242,7 @@ export default class SecondBrainPlugin extends Plugin {
     for (const file of tagged) {
       const ok = await this.syncFile(file, true);
       if (ok) synced++; else failed++;
-      // FIX: activeWindow.setTimeout for popout window compatibility (rule 30)
-      await new Promise((r) => activeWindow.setTimeout(r, 300));
+      await new Promise((r) => window.setTimeout(r, 300));
     }
 
     this.settings.lastSyncTime = Date.now();
@@ -244,14 +265,13 @@ export default class SecondBrainPlugin extends Plugin {
 
       const body = raw.replace(/^---[\s\S]*?---\n?/, "").trim();
       const title = file.basename;
-      const noteTags: string[] = frontmatter.tags ?? [];
+      const noteTags: string[] = (frontmatter.tags as string[] | undefined) ?? [];
 
-      // FIX: normalize stored IDs — support legacy single string and new array format.
-      // This lets us track all chunk IDs so every chunk is updated on re-sync.
-      const rawStoredId = frontmatter["second-brain-id"];
+      // Normalize stored IDs — support legacy single string and new array format.
+      const rawStoredId = frontmatter["second-brain-id"] as string | string[] | undefined;
       const existingIds: string[] = Array.isArray(rawStoredId)
         ? rawStoredId
-        : rawStoredId ? [rawStoredId as string] : [];
+        : rawStoredId ? [rawStoredId] : [];
 
       const fullContent = `${title}\n\n${body}`;
       const chunks = chunkText(fullContent, this.settings.chunkSize, this.settings.chunkOverlap);
@@ -280,9 +300,10 @@ export default class SecondBrainPlugin extends Plugin {
             throw: false,
           });
 
-          if (response.status !== 200 || !response.json?.ok) {
+          const updateJson = response.json as ApiResponse;
+          if (response.status !== 200 || !updateJson?.ok) {
             if (!silent) {
-              const errorMsg = response.json?.error ?? `Server returned ${response.status}`;
+              const errorMsg = updateJson?.error ?? `Server returned ${response.status}`;
               new Notice(`Second Brain error: ${errorMsg}`);
             }
             return false;
@@ -306,20 +327,20 @@ export default class SecondBrainPlugin extends Plugin {
             throw: false,
           });
 
+          const captureJson = response.json as ApiResponse;
           if (response.status !== 200) {
             if (!silent) {
-              const errorMsg = response.json?.error ?? `Server returned ${response.status}`;
+              const errorMsg = captureJson?.error ?? `Server returned ${response.status}`;
               new Notice(`Second Brain error: ${errorMsg}`);
             }
             return false;
           }
 
-          if (response.json?.id) newIds.push(response.json.id);
+          if (captureJson?.id) newIds.push(captureJson.id);
         }
 
         if (i < chunks.length - 1) {
-          // FIX: activeWindow.setTimeout for popout window compatibility (rule 30)
-          await new Promise((r) => activeWindow.setTimeout(r, 200));
+          await new Promise((r) => window.setTimeout(r, 200));
         }
       }
 
@@ -497,25 +518,8 @@ export default class SecondBrainPlugin extends Plugin {
     }
   }
 
-  async memoryAlreadyImported(memoryId: string): Promise<boolean> {
-    if (this.settings.importedIds?.includes(memoryId)) {
-      return true;
-    }
-
-    const markdownFiles = this.app.vault.getMarkdownFiles();
-    for (const file of markdownFiles) {
-      const cache = this.app.metadataCache.getFileCache(file);
-      const extId = cache?.frontmatter?.["external_memory_id"];
-      if (extId === memoryId) {
-        if (!this.settings.importedIds.includes(memoryId)) {
-          this.settings.importedIds.push(memoryId);
-          await this.saveSettings();
-        }
-        return true;
-      }
-    }
-
-    return false;
+  memoryAlreadyImported(memoryId: string): boolean {
+    return this.settings.importedIds?.includes(memoryId) ?? false;
   }
 
   async importMemories(silent = false): Promise<void> {
@@ -568,20 +572,21 @@ export default class SecondBrainPlugin extends Plugin {
         return;
       }
 
-      const data = response.json;
-      let memories: any[] = [];
+      const data = response.json as MemoryEntry[] | ListApiResponse;
+      let memories: MemoryEntry[] = [];
 
       if (Array.isArray(data)) {
         memories = data;
       } else if (data && typeof data === "object") {
-        if (Array.isArray(data.items)) {
-          memories = data.items;
-        } else if (Array.isArray(data.entries)) {
-          memories = data.entries;
-        } else if (Array.isArray(data.memories)) {
-          memories = data.memories;
-        } else if (Array.isArray(data.data)) {
-          memories = data.data;
+        const obj = data as ListApiResponse;
+        if (Array.isArray(obj.items)) {
+          memories = obj.items;
+        } else if (Array.isArray(obj.entries)) {
+          memories = obj.entries;
+        } else if (Array.isArray(obj.memories)) {
+          memories = obj.memories;
+        } else if (Array.isArray(obj.data)) {
+          memories = obj.data;
         } else {
           if (!silent) new Notice("Invalid response format: No array of memories found.");
           return;
@@ -616,9 +621,8 @@ export default class SecondBrainPlugin extends Plugin {
           continue;
         }
 
-        // Check if already imported
-        const alreadyImported = await this.memoryAlreadyImported(id);
-        if (alreadyImported) {
+        // Check if already imported (uses in-memory cache only — no vault scan)
+        if (this.memoryAlreadyImported(id)) {
           skippedCount++;
           continue;
         }
@@ -630,7 +634,7 @@ export default class SecondBrainPlugin extends Plugin {
 
           // Escaping double quotes in YAML fields
           const cleanId = id.replace(/"/g, '\\"');
-          const source = (item.source && typeof item.source === "string") ? item.source.replace(/"/g, '\\"') : "external-memory";
+          const source = (typeof item.source === "string") ? item.source.replace(/"/g, '\\"') : "external-memory";
           const createdAt = item.created_at != null ? String(item.created_at).replace(/"/g, '\\"') : "";
           const importedAt = new Date().toISOString();
 
@@ -675,16 +679,14 @@ imported_at: "${importedAt}"${tagsYaml}
 
       if (importedCount > 0) {
         let msg = `Imported ${importedCount} memory/memories.`;
-        if (failedCount > 0) {
-          msg += ` ${failedCount} failed.`;
-        }
+        if (skippedCount > 0) msg += ` ${skippedCount} skipped.`;
+        if (failedCount > 0) msg += ` ${failedCount} failed.`;
         new Notice(msg);
       } else {
         if (!silent) {
           let msg = "No new memories to import.";
-          if (failedCount > 0) {
-            msg += ` ${failedCount} failed.`;
-          }
+          if (skippedCount > 0) msg += ` ${skippedCount} skipped.`;
+          if (failedCount > 0) msg += ` ${failedCount} failed.`;
           new Notice(msg);
         }
       }
@@ -773,7 +775,7 @@ class SecondBrainSettingTab extends PluginSettingTab {
               } else {
                 new Notice(`Second Brain: unexpected status ${response.status}`);
               }
-            } catch (e) {
+            } catch {
               new Notice("Second Brain: could not reach Worker — check the URL");
             }
           })
@@ -793,6 +795,7 @@ class SecondBrainSettingTab extends PluginSettingTab {
           .onChange(async (value) => {
             this.plugin.settings.syncMode = value as SyncMode;
             await this.plugin.saveSettings();
+            // eslint-disable-next-line @typescript-eslint/no-deprecated
             this.display();
           });
       });
@@ -823,6 +826,7 @@ class SecondBrainSettingTab extends PluginSettingTab {
           .onChange(async (value) => {
             this.plugin.settings.autoSync = value;
             await this.plugin.saveSettings();
+            // eslint-disable-next-line @typescript-eslint/no-deprecated
             this.display();
           })
       );
@@ -943,10 +947,11 @@ class SecondBrainSettingTab extends PluginSettingTab {
       .addButton((btn) =>
         btn
           .setButtonText("Reset cache")
-          .setWarning()
+          .setDestructive()
           .onClick(async () => {
             this.plugin.settings.importedIds = [];
             await this.plugin.saveSettings();
+            // eslint-disable-next-line @typescript-eslint/no-deprecated
             this.display();
             new Notice("Imported IDs cache has been reset");
           })
