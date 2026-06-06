@@ -195,9 +195,9 @@ export default class SecondBrainPlugin extends Plugin {
     const existingTimer = this.debounceTimers.get(file.path);
     if (existingTimer) window.clearTimeout(existingTimer);
 
-    const timer = window.setTimeout(async () => {
+    const timer = window.setTimeout(() => {
       this.debounceTimers.delete(file.path);
-      await this.syncIfTagged(file);
+      void this.syncIfTagged(file);
     }, this.settings.autoSyncDelay);
 
     this.debounceTimers.set(file.path, timer);
@@ -349,7 +349,7 @@ export default class SecondBrainPlugin extends Plugin {
       // in Second Brain but won't receive further updates). They can be cleaned up
       // manually via the Second Brain web UI or the forget MCP tool.
       if (newIds.length > 0) {
-        await this.app.fileManager.processFrontMatter(file, (fm) => {
+        await this.app.fileManager.processFrontMatter(file, (fm: Record<string, unknown>) => {
           fm["second-brain-id"] = newIds.length === 1 ? newIds[0] : newIds;
           const now = new Date();
           const date = now.toLocaleString("en-US", { month: "long", day: "numeric", year: "numeric" });
@@ -419,7 +419,7 @@ export default class SecondBrainPlugin extends Plugin {
       const trimmed = tagsField.trim();
       if (trimmed.startsWith("[") && trimmed.endsWith("]")) {
         try {
-          const parsed = JSON.parse(trimmed);
+          const parsed: unknown = JSON.parse(trimmed);
           if (Array.isArray(parsed)) {
             rawTags = parsed.map(t => typeof t === "string" ? t.trim() : "").filter(Boolean);
           } else {
@@ -578,15 +578,14 @@ export default class SecondBrainPlugin extends Plugin {
       if (Array.isArray(data)) {
         memories = data;
       } else if (data && typeof data === "object") {
-        const obj = data as ListApiResponse;
-        if (Array.isArray(obj.items)) {
-          memories = obj.items;
-        } else if (Array.isArray(obj.entries)) {
-          memories = obj.entries;
-        } else if (Array.isArray(obj.memories)) {
-          memories = obj.memories;
-        } else if (Array.isArray(obj.data)) {
-          memories = obj.data;
+        if (Array.isArray(data.items)) {
+          memories = data.items;
+        } else if (Array.isArray(data.entries)) {
+          memories = data.entries;
+        } else if (Array.isArray(data.memories)) {
+          memories = data.memories;
+        } else if (Array.isArray(data.data)) {
+          memories = data.data;
         } else {
           if (!silent) new Notice("Invalid response format: No array of memories found.");
           return;
@@ -699,7 +698,7 @@ imported_at: "${importedAt}"${tagsYaml}
   }
 
   async loadSettings() {
-    this.settings = Object.assign({}, DEFAULT_SETTINGS, await this.loadData());
+    this.settings = Object.assign({}, DEFAULT_SETTINGS, await this.loadData() as unknown as Partial<SecondBrainSettings>);
   }
 
   async saveSettings() {
@@ -718,6 +717,10 @@ class SecondBrainSettingTab extends PluginSettingTab {
   }
 
   display(): void {
+    this.render();
+  }
+
+  private render(): void {
     const { containerEl } = this;
     containerEl.empty();
 
@@ -795,8 +798,7 @@ class SecondBrainSettingTab extends PluginSettingTab {
           .onChange(async (value) => {
             this.plugin.settings.syncMode = value as SyncMode;
             await this.plugin.saveSettings();
-            // eslint-disable-next-line @typescript-eslint/no-deprecated
-            this.display();
+            this.render();
           });
       });
 
@@ -826,8 +828,7 @@ class SecondBrainSettingTab extends PluginSettingTab {
           .onChange(async (value) => {
             this.plugin.settings.autoSync = value;
             await this.plugin.saveSettings();
-            // eslint-disable-next-line @typescript-eslint/no-deprecated
-            this.display();
+            this.render();
           })
       );
 
@@ -947,12 +948,10 @@ class SecondBrainSettingTab extends PluginSettingTab {
       .addButton((btn) =>
         btn
           .setButtonText("Reset cache")
-          .setDestructive()
           .onClick(async () => {
             this.plugin.settings.importedIds = [];
             await this.plugin.saveSettings();
-            // eslint-disable-next-line @typescript-eslint/no-deprecated
-            this.display();
+            this.render();
             new Notice("Imported IDs cache has been reset");
           })
       );
