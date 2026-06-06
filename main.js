@@ -65,7 +65,7 @@ var SecondBrainPlugin = class extends import_obsidian.Plugin {
   constructor() {
     super(...arguments);
     this.statusBar = null;
-    // number (browser) rather than NodeJS.Timeout — we use activeWindow.setTimeout
+    // number (browser) rather than NodeJS.Timeout — we use window.setTimeout
     this.debounceTimers = /* @__PURE__ */ new Map();
     this.syncingFiles = /* @__PURE__ */ new Set();
     this.isImporting = false;
@@ -77,13 +77,13 @@ var SecondBrainPlugin = class extends import_obsidian.Plugin {
       this.updateStatusBar();
     }
     this.addRibbonIcon("brain", "Sync current note to Second Brain", () => {
-      this.syncActiveNote();
+      void this.syncActiveNote();
     });
     this.addCommand({
       id: "sync-current-note",
       name: "Sync current note",
       editorCallback: (_editor, view) => {
-        this.syncFile(view.file);
+        void this.syncFile(view.file);
       }
     });
     this.addCommand({
@@ -140,8 +140,8 @@ var SecondBrainPlugin = class extends import_obsidian.Plugin {
       return;
     const existingTimer = this.debounceTimers.get(file.path);
     if (existingTimer)
-      clearTimeout(existingTimer);
-    const timer = activeWindow.setTimeout(async () => {
+      window.clearTimeout(existingTimer);
+    const timer = window.setTimeout(async () => {
       this.debounceTimers.delete(file.path);
       await this.syncIfTagged(file);
     }, this.settings.autoSyncDelay);
@@ -183,7 +183,7 @@ var SecondBrainPlugin = class extends import_obsidian.Plugin {
         synced++;
       else
         failed++;
-      await new Promise((r) => activeWindow.setTimeout(r, 300));
+      await new Promise((r) => window.setTimeout(r, 300));
     }
     this.settings.lastSyncTime = Date.now();
     await this.saveSettings();
@@ -191,7 +191,7 @@ var SecondBrainPlugin = class extends import_obsidian.Plugin {
     new import_obsidian.Notice(`Second Brain: ${synced} synced${failed ? `, ${failed} failed` : ""}`);
   }
   async syncFile(file, silent = false) {
-    var _a, _b, _c, _d, _e, _f, _g, _h, _i, _j;
+    var _a, _b, _c, _d, _e, _f;
     if (!this.validateSettings())
       return false;
     if (this.syncingFiles.has(file.path))
@@ -225,9 +225,10 @@ ${body}`;
             body: JSON.stringify({ id: existingIds[i], content: chunkContent }),
             throw: false
           });
-          if (response.status !== 200 || !((_e = response.json) == null ? void 0 : _e.ok)) {
+          const updateJson = response.json;
+          if (response.status !== 200 || !(updateJson == null ? void 0 : updateJson.ok)) {
             if (!silent) {
-              const errorMsg = (_g = (_f = response.json) == null ? void 0 : _f.error) != null ? _g : `Server returned ${response.status}`;
+              const errorMsg = (_e = updateJson == null ? void 0 : updateJson.error) != null ? _e : `Server returned ${response.status}`;
               new import_obsidian.Notice(`Second Brain error: ${errorMsg}`);
             }
             return false;
@@ -248,18 +249,19 @@ ${body}`;
             }),
             throw: false
           });
+          const captureJson = response.json;
           if (response.status !== 200) {
             if (!silent) {
-              const errorMsg = (_i = (_h = response.json) == null ? void 0 : _h.error) != null ? _i : `Server returned ${response.status}`;
+              const errorMsg = (_f = captureJson == null ? void 0 : captureJson.error) != null ? _f : `Server returned ${response.status}`;
               new import_obsidian.Notice(`Second Brain error: ${errorMsg}`);
             }
             return false;
           }
-          if ((_j = response.json) == null ? void 0 : _j.id)
-            newIds.push(response.json.id);
+          if (captureJson == null ? void 0 : captureJson.id)
+            newIds.push(captureJson.id);
         }
         if (i < chunks.length - 1) {
-          await new Promise((r) => activeWindow.setTimeout(r, 200));
+          await new Promise((r) => window.setTimeout(r, 200));
         }
       }
       if (newIds.length > 0) {
@@ -403,24 +405,9 @@ ${body}`;
       }
     }
   }
-  async memoryAlreadyImported(memoryId) {
+  memoryAlreadyImported(memoryId) {
     var _a, _b;
-    if ((_a = this.settings.importedIds) == null ? void 0 : _a.includes(memoryId)) {
-      return true;
-    }
-    const markdownFiles = this.app.vault.getMarkdownFiles();
-    for (const file of markdownFiles) {
-      const cache = this.app.metadataCache.getFileCache(file);
-      const extId = (_b = cache == null ? void 0 : cache.frontmatter) == null ? void 0 : _b["external_memory_id"];
-      if (extId === memoryId) {
-        if (!this.settings.importedIds.includes(memoryId)) {
-          this.settings.importedIds.push(memoryId);
-          await this.saveSettings();
-        }
-        return true;
-      }
-    }
-    return false;
+    return (_b = (_a = this.settings.importedIds) == null ? void 0 : _a.includes(memoryId)) != null ? _b : false;
   }
   async importMemories(silent = false) {
     var _a, _b, _c, _d;
@@ -472,14 +459,15 @@ ${body}`;
       if (Array.isArray(data)) {
         memories = data;
       } else if (data && typeof data === "object") {
-        if (Array.isArray(data.items)) {
-          memories = data.items;
-        } else if (Array.isArray(data.entries)) {
-          memories = data.entries;
-        } else if (Array.isArray(data.memories)) {
-          memories = data.memories;
-        } else if (Array.isArray(data.data)) {
-          memories = data.data;
+        const obj = data;
+        if (Array.isArray(obj.items)) {
+          memories = obj.items;
+        } else if (Array.isArray(obj.entries)) {
+          memories = obj.entries;
+        } else if (Array.isArray(obj.memories)) {
+          memories = obj.memories;
+        } else if (Array.isArray(obj.data)) {
+          memories = obj.data;
         } else {
           if (!silent)
             new import_obsidian.Notice("Invalid response format: No array of memories found.");
@@ -506,8 +494,7 @@ ${body}`;
           skippedCount++;
           continue;
         }
-        const alreadyImported = await this.memoryAlreadyImported(id);
-        if (alreadyImported) {
+        if (this.memoryAlreadyImported(id)) {
           skippedCount++;
           continue;
         }
@@ -515,7 +502,7 @@ ${body}`;
           const title = this.generateMemoryTitle(content, id);
           const path = this.getAvailableFilePath(importFolder, title);
           const cleanId = id.replace(/"/g, '\\"');
-          const source = item.source && typeof item.source === "string" ? item.source.replace(/"/g, '\\"') : "external-memory";
+          const source = typeof item.source === "string" ? item.source.replace(/"/g, '\\"') : "external-memory";
           const createdAt = item.created_at != null ? String(item.created_at).replace(/"/g, '\\"') : "";
           const importedAt = (/* @__PURE__ */ new Date()).toISOString();
           const tagsYaml = rawTags.length > 0 ? "\ntags:\n" + rawTags.map((t) => `  - ${t}`).join("\n") : "";
@@ -551,16 +538,18 @@ ${content}`;
       }
       if (importedCount > 0) {
         let msg = `Imported ${importedCount} memory/memories.`;
-        if (failedCount > 0) {
+        if (skippedCount > 0)
+          msg += ` ${skippedCount} skipped.`;
+        if (failedCount > 0)
           msg += ` ${failedCount} failed.`;
-        }
         new import_obsidian.Notice(msg);
       } else {
         if (!silent) {
           let msg = "No new memories to import.";
-          if (failedCount > 0) {
+          if (skippedCount > 0)
+            msg += ` ${skippedCount} skipped.`;
+          if (failedCount > 0)
             msg += ` ${failedCount} failed.`;
-          }
           new import_obsidian.Notice(msg);
         }
       }
@@ -702,7 +691,7 @@ var SecondBrainSettingTab = class extends import_obsidian.PluginSettingTab {
       })
     );
     new import_obsidian.Setting(containerEl).setName("Reset imported IDs cache").setDesc(`Clear the list of previously imported memory IDs. Currently contains ${(_b = (_a = this.plugin.settings.importedIds) == null ? void 0 : _a.length) != null ? _b : 0} ID(s).`).addButton(
-      (btn) => btn.setButtonText("Reset cache").setWarning().onClick(async () => {
+      (btn) => btn.setButtonText("Reset cache").setDestructive().onClick(async () => {
         this.plugin.settings.importedIds = [];
         await this.plugin.saveSettings();
         this.display();
