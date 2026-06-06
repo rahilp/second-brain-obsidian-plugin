@@ -71,7 +71,8 @@ function chunkText(text: string, maxChars: number, overlapChars: number): string
 export default class SecondBrainPlugin extends Plugin {
   settings: SecondBrainSettings;
   statusBar: HTMLElement | null = null;
-  debounceTimers: Map<string, NodeJS.Timeout> = new Map();
+  // number (browser) rather than NodeJS.Timeout — we use activeWindow.setTimeout
+  debounceTimers: Map<string, number> = new Map();
   syncingFiles: Set<string> = new Set();
 
   async onload() {
@@ -86,9 +87,10 @@ export default class SecondBrainPlugin extends Plugin {
       this.syncActiveNote();
     });
 
+    // FIX: command names must not include the plugin name (rule 15)
     this.addCommand({
       id: "sync-current-note",
-      name: "Sync current note to Second Brain",
+      name: "Sync current note",
       editorCallback: (_editor: Editor, view: MarkdownView) => {
         this.syncFile(view.file!);
       },
@@ -96,25 +98,36 @@ export default class SecondBrainPlugin extends Plugin {
 
     this.addCommand({
       id: "sync-all-tagged",
-      name: "Sync all notes to Second Brain",
+      name: "Sync all tagged notes",
       callback: () => this.syncAllTagged(),
     });
 
-    if (this.settings.autoSync) {
-      this.registerEvent(
-        this.app.vault.on("modify", async (file) => {
-          if (file instanceof TFile && file.extension === "md") {
-            await this.debouncedSyncIfTagged(file);
-          }
-        })
-      );
-    }
+    // FIX: always register modify event; gate on this.settings.autoSync inside the
+    // handler so toggling auto-sync in settings takes effect immediately without
+    // requiring an Obsidian restart.
+    this.registerEvent(
+      this.app.vault.on("modify", async (file) => {
+        if (!this.settings.autoSync) return;
+        if (file instanceof TFile && file.extension === "md") {
+          await this.debouncedSyncIfTagged(file);
+        }
+      })
+    );
+
+    // Re-sync on rename so the stored title stays current in Second Brain.
+    this.registerEvent(
+      this.app.vault.on("rename", async (file, _oldPath) => {
+        if (file instanceof TFile && file.extension === "md") {
+          await this.syncIfTagged(file, true);
+        }
+      })
+    );
 
     this.addSettingTab(new SecondBrainSettingTab(this.app, this));
   }
 
-  // FIX 1: removed onunload that called detachLeavesOfType
-  // Obsidian handles leaf lifecycle automatically
+  // FIX: removed onunload that called detachLeavesOfType — Obsidian handles
+  // leaf lifecycle automatically, and registerEvent handles event cleanup.
 
   // ── Sync methods ────────────────────────────────────────────────────────────
 
@@ -125,15 +138,13 @@ export default class SecondBrainPlugin extends Plugin {
   }
 
   async debouncedSyncIfTagged(file: TFile) {
-    // If we're currently syncing this file, ignore this modify event
     if (this.syncingFiles.has(file.path)) return;
 
-    // Clear any existing timer for this file
     const existingTimer = this.debounceTimers.get(file.path);
     if (existingTimer) clearTimeout(existingTimer);
 
-    // Set a new timer
-    const timer = setTimeout(async () => {
+    // FIX: use activeWindow.setTimeout for popout window compatibility (rule 30)
+    const timer = activeWindow.setTimeout(async () => {
       this.debounceTimers.delete(file.path);
       await this.syncIfTagged(file);
     }, this.settings.autoSyncDelay);
@@ -141,15 +152,18 @@ export default class SecondBrainPlugin extends Plugin {
     this.debounceTimers.set(file.path, timer);
   }
 
-  async syncIfTagged(file: TFile) {
+  async syncIfTagged(file: TFile, silent = false) {
     if (this.settings.syncMode === "all") {
-      await this.syncFile(file, true);
+      await this.syncFile(file, silent);
       return;
     }
     const cache = this.app.metadataCache.getFileCache(file);
-    const tags: string[] = cache?.frontmatter?.tags ?? [];
-    if (!tags.includes(this.settings.syncTag)) return;
-    await this.syncFile(file, true);
+    const frontmatterTags: string[] = cache?.frontmatter?.tags ?? [];
+    // cache.tags includes inline tags (#brain in body); strip the leading #
+    const inlineTags: string[] = (cache?.tags ?? []).map((t) => t.tag.replace(/^#/, ""));
+    const allTags = [...frontmatterTags, ...inlineTags];
+    if (!allTags.includes(this.settings.syncTag)) return;
+    await this.syncFile(file, silent);
   }
 
   async syncAllTagged() {
@@ -177,7 +191,8 @@ export default class SecondBrainPlugin extends Plugin {
     for (const file of tagged) {
       const ok = await this.syncFile(file, true);
       if (ok) synced++; else failed++;
-      await new Promise((r) => setTimeout(r, 300));
+      // FIX: activeWindow.setTimeout for popout window compatibility (rule 30)
+      await new Promise((r) => activeWindow.setTimeout(r, 300));
     }
 
     this.settings.lastSyncTime = Date.now();
@@ -190,7 +205,6 @@ export default class SecondBrainPlugin extends Plugin {
   async syncFile(file: TFile, silent = false): Promise<boolean> {
     if (!this.validateSettings()) return false;
 
-    // Prevent duplicate syncs
     if (this.syncingFiles.has(file.path)) return true;
     this.syncingFiles.add(file.path);
 
@@ -202,58 +216,52 @@ export default class SecondBrainPlugin extends Plugin {
       const body = raw.replace(/^---[\s\S]*?---\n?/, "").trim();
       const title = file.basename;
       const noteTags: string[] = frontmatter.tags ?? [];
-      const existingId = frontmatter["second-brain-id"] as string | undefined;
+
+      // FIX: normalize stored IDs — support legacy single string and new array format.
+      // This lets us track all chunk IDs so every chunk is updated on re-sync.
+      const rawStoredId = frontmatter["second-brain-id"];
+      const existingIds: string[] = Array.isArray(rawStoredId)
+        ? rawStoredId
+        : rawStoredId ? [rawStoredId as string] : [];
 
       const fullContent = `${title}\n\n${body}`;
       const chunks = chunkText(fullContent, this.settings.chunkSize, this.settings.chunkOverlap);
+      const capturedTags = [...new Set([...noteTags, "obsidian", file.parent?.name ?? ""].filter(Boolean))];
 
-      // If we have an existing ID, use append; otherwise use capture
-      if (existingId) {
-        // Append mode: send full content as an addition
-        const payload: Record<string, unknown> = {
-          id: existingId,
-          addition: fullContent,
-        };
+      const newIds: string[] = [];
 
-        const response = await requestUrl({
-          url: `${this.settings.workerUrl}/append`,
-          method: "POST",
-          headers: {
-            Authorization: `Bearer ${this.settings.authToken}`,
-            "Content-Type": "application/json",
-          },
-          body: JSON.stringify(payload),
-          throw: false,
-        });
+      for (let i = 0; i < chunks.length; i++) {
+        const chunkContent = chunks.length > 1
+          ? `${chunks[i]} [chunk ${i + 1}/${chunks.length}]`
+          : chunks[i];
 
-        if (response.status !== 200) {
-          if (!silent) {
-            const errorMsg = response.json?.error ?? `Server returned ${response.status}`;
-            new Notice(`Second Brain error: ${errorMsg}`);
+        if (i < existingIds.length) {
+          // FIX: use /update (full replace + re-embed) instead of /append.
+          // /append treats the content as an addendum and accumulates it —
+          // re-syncing a note would keep appending the full content on each save.
+          // /update replaces the entry content and re-embeds cleanly.
+          const response = await requestUrl({
+            url: `${this.settings.workerUrl}/update`,
+            method: "POST",
+            headers: {
+              Authorization: `Bearer ${this.settings.authToken}`,
+              "Content-Type": "application/json",
+            },
+            body: JSON.stringify({ id: existingIds[i], content: chunkContent }),
+            throw: false,
+          });
+
+          if (response.status !== 200 || !response.json?.ok) {
+            if (!silent) {
+              const errorMsg = response.json?.error ?? `Server returned ${response.status}`;
+              new Notice(`Second Brain error: ${errorMsg}`);
+            }
+            return false;
           }
-          return false;
-        }
 
-        this.settings.lastSyncTime = Date.now();
-        await this.saveSettings();
-        this.updateStatusBar();
-
-        if (!silent) {
-          new Notice(`✓ Updated "${title}" in Second Brain`);
-        }
-
-        return true;
-      } else {
-        // Capture mode: create new entry
-        let capturedId: string | undefined;
-
-        for (let i = 0; i < chunks.length; i++) {
-          const payload: Record<string, unknown> = {
-            content: chunks.length > 1 ? `${chunks[i]} [chunk ${i + 1}/${chunks.length}]` : chunks[i],
-            source: "obsidian",
-            tags: [...noteTags, "obsidian", file.parent?.name ?? ""].filter(Boolean),
-          };
-
+          newIds.push(existingIds[i]);
+        } else {
+          // Capture new chunk — either first-time sync or note grew since last sync
           const response = await requestUrl({
             url: `${this.settings.workerUrl}/capture`,
             method: "POST",
@@ -261,7 +269,11 @@ export default class SecondBrainPlugin extends Plugin {
               Authorization: `Bearer ${this.settings.authToken}`,
               "Content-Type": "application/json",
             },
-            body: JSON.stringify(payload),
+            body: JSON.stringify({
+              content: chunkContent,
+              source: "obsidian",
+              tags: capturedTags,
+            }),
             throw: false,
           });
 
@@ -273,38 +285,47 @@ export default class SecondBrainPlugin extends Plugin {
             return false;
           }
 
-          // Store the ID from the first chunk
-          if (i === 0 && response.json?.id) {
-            capturedId = response.json.id;
-          }
-
-          if (i < chunks.length - 1) await new Promise((r) => setTimeout(r, 200));
+          if (response.json?.id) newIds.push(response.json.id);
         }
 
-        // Save the ID to frontmatter if we got one
-        if (capturedId) {
-          await this.app.fileManager.processFrontMatter(file, (fm) => {
-            fm["second-brain-id"] = capturedId;
-          });
+        if (i < chunks.length - 1) {
+          // FIX: activeWindow.setTimeout for popout window compatibility (rule 30)
+          await new Promise((r) => activeWindow.setTimeout(r, 200));
         }
-
-        this.settings.lastSyncTime = Date.now();
-        await this.saveSettings();
-        this.updateStatusBar();
-
-        if (!silent) {
-          const chunkNote = chunks.length > 1 ? ` (${chunks.length} chunks)` : "";
-          new Notice(`✓ Saved "${title}" to Second Brain${chunkNote}`);
-        }
-
-        return true;
       }
+
+      // Persist IDs for all active chunks. If the note shrank and has fewer chunks
+      // than before, the extra old IDs are no longer tracked (those entries remain
+      // in Second Brain but won't receive further updates). They can be cleaned up
+      // manually via the Second Brain web UI or the forget MCP tool.
+      if (newIds.length > 0) {
+        await this.app.fileManager.processFrontMatter(file, (fm) => {
+          fm["second-brain-id"] = newIds.length === 1 ? newIds[0] : newIds;
+          const now = new Date();
+          const date = now.toLocaleString("en-US", { month: "long", day: "numeric", year: "numeric" });
+          const time = now.toLocaleString("en-US", { hour: "numeric", minute: "2-digit", hour12: true, timeZoneName: "short" });
+          fm["second-brain-synced"] = `${date} - ${time}`;
+        });
+      }
+
+      this.settings.lastSyncTime = Date.now();
+      await this.saveSettings();
+      this.updateStatusBar();
+
+      if (!silent) {
+        const isUpdate = existingIds.length > 0;
+        const chunkNote = chunks.length > 1 ? ` (${chunks.length} chunks)` : "";
+        new Notice(isUpdate
+          ? `✓ Updated "${title}" in Second Brain${chunkNote}`
+          : `✓ Saved "${title}" to Second Brain${chunkNote}`);
+      }
+
+      return true;
     } catch (e) {
       if (!silent) new Notice("Second Brain: failed to connect to Worker");
       console.error("Second Brain sync error:", e);
       return false;
     } finally {
-      // Always remove from syncing set
       this.syncingFiles.delete(file.path);
     }
   }
@@ -356,7 +377,6 @@ class SecondBrainSettingTab extends PluginSettingTab {
     const { containerEl } = this;
     containerEl.empty();
 
-    // FIX 3: use Setting.setHeading() for all section headers instead of createEl("h2/h3")
     new Setting(containerEl).setName("Second Brain").setHeading();
 
     // ── Connection ──────────────────────────────────────────────────────────
@@ -527,6 +547,14 @@ class SecondBrainSettingTab extends PluginSettingTab {
           .onChange(async (value) => {
             this.plugin.settings.showSyncStatus = value;
             await this.plugin.saveSettings();
+            // FIX: manage status bar element lifecycle when toggled
+            if (value && !this.plugin.statusBar) {
+              this.plugin.statusBar = this.plugin.addStatusBarItem();
+              this.plugin.updateStatusBar();
+            } else if (!value && this.plugin.statusBar) {
+              this.plugin.statusBar.remove();
+              this.plugin.statusBar = null;
+            }
           })
       );
 
