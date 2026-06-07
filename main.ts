@@ -722,6 +722,84 @@ imported_at: "${importedAt}"${tagsYaml}
     }
   }
 
+  // ── Search / recall ─────────────────────────────────────────────────────────
+
+  async recallMemories(query: string, topK = 10): Promise<
+    | { ok: true; results: NormalizedRecallResult[]; insight: string | null }
+    | { ok: false; error: string }
+  > {
+    const trimmedQuery = query.trim();
+    if (!trimmedQuery) {
+      return { ok: false, error: "Please enter a search query." };
+    }
+
+    if (!this.settings.workerUrl) {
+      return { ok: false, error: "Worker URL is not configured. Go to Settings to configure." };
+    }
+    if (!this.settings.authToken) {
+      return { ok: false, error: "Auth token is not configured. Go to Settings to configure." };
+    }
+
+    const workerUrl = this.normalizeWorkerUrl(this.settings.workerUrl);
+    const authToken = this.settings.authToken;
+    // topK is clamped server-side to 1-20; clamp client-side too so the intent is clear.
+    const clampedTopK = Math.min(20, Math.max(1, Math.floor(topK)));
+    const url = `${workerUrl}/recall?query=${encodeURIComponent(trimmedQuery)}&topK=${clampedTopK}`;
+
+    let response;
+    try {
+      response = await requestUrl({
+        url,
+        method: "GET",
+        headers: {
+          Authorization: `Bearer ${authToken}`,
+          Accept: "application/json",
+        },
+        throw: false,
+      });
+    } catch (e) {
+      console.error("Second Brain recall request failed:", e);
+      return { ok: false, error: "Could not reach the Second Brain Worker. Check the Worker URL and your connection." };
+    }
+
+    if (response.status !== 200) {
+      let errorMsg = `Server returned ${response.status}`;
+      if (response.status === 400) {
+        errorMsg = "Search query was empty or invalid.";
+      } else if (response.status === 401) {
+        errorMsg = "Unauthorized. Please check your auth token.";
+      }
+      return { ok: false, error: errorMsg };
+    }
+
+    const data = response.json as RecallApiResponse;
+    if (!data || typeof data !== "object" || !Array.isArray(data.results)) {
+      return { ok: false, error: "Unexpected response format from Worker." };
+    }
+
+    const results: NormalizedRecallResult[] = data.results
+      .filter((item): item is RecallResult & { id: string; content: string } =>
+        typeof item?.id === "string" && typeof item?.content === "string"
+      )
+      .map((item) => ({
+        id: item.id,
+        title: this.generateMemoryTitle(item.content, item.id),
+        snippet: this.buildSnippet(item.content),
+        tags: this.parseMemoryTags(item.tags),
+        score: typeof item.score === "number" && Number.isFinite(item.score) ? item.score : null,
+      }));
+
+    const insight = typeof data.insight === "string" && data.insight.trim() ? data.insight.trim() : null;
+
+    return { ok: true, results, insight };
+  }
+
+  buildSnippet(content: string, maxChars = 220): string {
+    const flat = content.replace(/\s+/g, " ").trim();
+    if (flat.length <= maxChars) return flat;
+    return flat.slice(0, maxChars).trim() + "…";
+  }
+
   async loadSettings() {
     this.settings = Object.assign({}, DEFAULT_SETTINGS, await this.loadData() as unknown as Partial<SecondBrainSettings>);
   }
