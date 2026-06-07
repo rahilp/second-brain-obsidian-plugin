@@ -171,6 +171,14 @@ export default class SecondBrainPlugin extends Plugin {
       },
     });
 
+    this.addCommand({
+      id: "search-memories",
+      name: "Search memories",
+      callback: () => {
+        new SearchModal(this.app, this).open();
+      },
+    });
+
     // FIX: always register modify event; gate on this.settings.autoSync inside the
     // handler so toggling auto-sync in settings takes effect immediately without
     // requiring an Obsidian restart.
