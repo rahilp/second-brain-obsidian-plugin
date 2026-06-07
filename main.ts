@@ -2,6 +2,7 @@ import {
   App,
   Editor,
   MarkdownView,
+  Modal,
   Plugin,
   PluginSettingTab,
   Setting,
@@ -806,6 +807,149 @@ imported_at: "${importedAt}"${tagsYaml}
 
   async saveSettings() {
     await this.saveData(this.settings);
+  }
+}
+
+// ─── Search Modal ─────────────────────────────────────────────────────────────
+
+class SearchModal extends Modal {
+  plugin: SecondBrainPlugin;
+  queryInput: HTMLInputElement;
+  resultsEl: HTMLElement;
+  isSearching = false;
+
+  constructor(app: App, plugin: SecondBrainPlugin) {
+    super(app);
+    this.plugin = plugin;
+  }
+
+  onOpen() {
+    const { contentEl } = this;
+    contentEl.empty();
+    contentEl.addClass("second-brain-search-modal");
+
+    contentEl.createEl("h2", { text: "Search Second Brain" });
+
+    const searchRow = contentEl.createDiv({ cls: "second-brain-search-row" });
+
+    this.queryInput = searchRow.createEl("input", {
+      type: "text",
+      placeholder: "Ask your Second Brain anything…",
+      cls: "second-brain-search-input",
+    });
+    this.queryInput.style.width = "100%";
+
+    this.queryInput.addEventListener("keydown", (evt) => {
+      if (evt.key === "Enter") {
+        evt.preventDefault();
+        void this.runSearch();
+      }
+    });
+
+    const buttonRow = contentEl.createDiv({ cls: "second-brain-search-buttons" });
+    buttonRow.style.marginTop = "8px";
+    buttonRow.style.marginBottom = "12px";
+
+    const searchButton = buttonRow.createEl("button", { text: "Search" });
+    searchButton.addEventListener("click", () => void this.runSearch());
+
+    this.resultsEl = contentEl.createDiv({ cls: "second-brain-search-results" });
+
+    this.queryInput.focus();
+  }
+
+  onClose() {
+    this.contentEl.empty();
+  }
+
+  async runSearch() {
+    if (this.isSearching) return;
+
+    const query = this.queryInput.value;
+    this.isSearching = true;
+    this.renderLoading();
+
+    try {
+      const outcome = await this.plugin.recallMemories(query);
+      if (!outcome.ok) {
+        this.renderError(outcome.error);
+        return;
+      }
+      this.renderResults(outcome.results, outcome.insight);
+    } finally {
+      this.isSearching = false;
+    }
+  }
+
+  renderLoading() {
+    this.resultsEl.empty();
+    this.resultsEl.createEl("p", { text: "Searching…", cls: "second-brain-search-status" });
+  }
+
+  renderError(message: string) {
+    this.resultsEl.empty();
+    this.resultsEl.createEl("p", {
+      text: message,
+      cls: "second-brain-search-status second-brain-search-error",
+    });
+  }
+
+  renderResults(results: NormalizedRecallResult[], insight: string | null) {
+    this.resultsEl.empty();
+
+    if (insight) {
+      const insightEl = this.resultsEl.createDiv({ cls: "second-brain-search-insight" });
+      insightEl.style.padding = "8px 12px";
+      insightEl.style.marginBottom = "12px";
+      insightEl.style.borderRadius = "6px";
+      insightEl.style.background = "var(--background-secondary)";
+      insightEl.style.fontStyle = "italic";
+      insightEl.setText(insight);
+    }
+
+    if (results.length === 0) {
+      this.resultsEl.createEl("p", {
+        text: "No memories found for that query.",
+        cls: "second-brain-search-status",
+      });
+      return;
+    }
+
+    const list = this.resultsEl.createEl("ul", { cls: "second-brain-search-list" });
+    list.style.listStyle = "none";
+    list.style.padding = "0";
+
+    for (const result of results) {
+      const item = list.createEl("li", { cls: "second-brain-search-item" });
+      item.style.padding = "8px 0";
+      item.style.borderBottom = "1px solid var(--background-modifier-border)";
+
+      const titleRow = item.createDiv({ cls: "second-brain-search-item-title" });
+      titleRow.style.display = "flex";
+      titleRow.style.justifyContent = "space-between";
+      titleRow.style.fontWeight = "600";
+
+      titleRow.createSpan({ text: result.title });
+
+      if (result.score !== null) {
+        titleRow.createSpan({
+          text: result.score.toFixed(1),
+          cls: "second-brain-search-item-score",
+        });
+      }
+
+      item.createEl("p", {
+        text: result.snippet,
+        cls: "second-brain-search-item-snippet",
+      });
+
+      if (result.tags.length > 0) {
+        const tagsEl = item.createDiv({ cls: "second-brain-search-item-tags" });
+        tagsEl.style.fontSize = "0.85em";
+        tagsEl.style.color = "var(--text-muted)";
+        tagsEl.setText(result.tags.map((t) => `#${t}`).join("  "));
+      }
+    }
   }
 }
 
