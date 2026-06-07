@@ -100,6 +100,31 @@ interface ListApiResponse {
   data?: MemoryEntry[];
 }
 
+interface RecallResult {
+  id?: unknown;
+  content?: unknown;
+  score?: unknown;
+  tags?: unknown;
+  source?: unknown;
+  created_at?: unknown;
+  updated?: unknown;
+}
+
+interface RecallApiResponse {
+  ok?: boolean;
+  results?: RecallResult[];
+  insight?: string;
+  error?: string;
+}
+
+interface NormalizedRecallResult {
+  id: string;
+  title: string;
+  snippet: string;
+  tags: string[];
+  score: number | null;
+}
+
 // ─── Plugin ───────────────────────────────────────────────────────────────────
 
 export default class SecondBrainPlugin extends Plugin {
