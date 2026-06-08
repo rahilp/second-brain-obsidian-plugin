@@ -1064,6 +1064,7 @@ class SearchView extends ItemView {
   expandedIds: Set<string> = new Set();
   isSearching = false;
   requestToken = 0;
+  lastQuery = "";
 
   constructor(leaf: WorkspaceLeaf, plugin: SecondBrainPlugin) {
     super(leaf);
@@ -1123,6 +1124,7 @@ class SearchView extends ItemView {
     const query = this.queryInput.value;
     const token = ++this.requestToken;
     this.isSearching = true;
+    this.lastQuery = query;
     this.renderLoading();
 
     try {
@@ -1155,12 +1157,32 @@ class SearchView extends ItemView {
     });
   }
 
+  defaultSaveFolder(): string {
+    return this.plugin.settings.importFolder?.trim() || "_Second Brain/Inbox";
+  }
+
   renderResults(results: NormalizedRecallResult[], insight: string | null) {
     this.resultsEl.empty();
 
     if (insight) {
       const insightEl = this.resultsEl.createDiv({ cls: "second-brain-search-insight" });
-      insightEl.setText(insight);
+
+      const insightText = insightEl.createDiv({ cls: "second-brain-search-insight-text" });
+      insightText.setText(insight);
+
+      const saveInsightButton = insightEl.createEl("button", {
+        cls: "second-brain-save-icon-button",
+        attr: { "aria-label": "Save insight as note" },
+      });
+      setIcon(saveInsightButton, "file-plus");
+      saveInsightButton.addEventListener("click", () => {
+        new SaveNoteModal(
+          this.app,
+          this.plugin.defaultInsightNoteTitle(this.lastQuery),
+          this.defaultSaveFolder(),
+          (title, folder) => this.plugin.saveInsightAsNote(this.lastQuery, insight, title, folder)
+        ).open();
+      });
     }
 
     if (results.length === 0) {
@@ -1170,6 +1192,17 @@ class SearchView extends ItemView {
       });
       return;
     }
+
+    const saveAllRow = this.resultsEl.createDiv({ cls: "second-brain-search-save-all-row" });
+    const saveAllButton = saveAllRow.createEl("button", { text: "Save all as note" });
+    saveAllButton.addEventListener("click", () => {
+      new SaveNoteModal(
+        this.app,
+        this.plugin.defaultSearchNoteTitle(this.lastQuery),
+        this.defaultSaveFolder(),
+        (title, folder) => this.plugin.saveSearchResultsAsNote(this.lastQuery, results, title, folder)
+      ).open();
+    });
 
     const list = this.resultsEl.createEl("ul", { cls: "second-brain-search-list" });
 
