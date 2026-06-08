@@ -122,6 +122,7 @@ interface NormalizedRecallResult {
   id: string;
   title: string;
   snippet: string;
+  content: string;
   tags: string[];
   score: number | null;
 }
@@ -794,6 +795,7 @@ imported_at: "${importedAt}"${tagsYaml}
         id: item.id,
         title: this.generateMemoryTitle(item.content, item.id),
         snippet: this.buildSnippet(item.content),
+        content: item.content,
         tags: this.parseMemoryTags(item.tags),
         score: typeof item.score === "number" && Number.isFinite(item.score) ? item.score : null,
       }));
