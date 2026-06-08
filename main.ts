@@ -3,6 +3,7 @@ import {
   Editor,
   ItemView,
   MarkdownView,
+  Modal,
   Plugin,
   PluginSettingTab,
   Setting,
@@ -12,6 +13,7 @@ import {
   WorkspaceLeaf,
   requestUrl,
   normalizePath,
+  setIcon,
 } from "obsidian";
 
 // ─── Settings ─────────────────────────────────────────────────────────────────
@@ -1100,6 +1102,71 @@ class SearchView extends ItemView {
         tagsEl.createEl("span", { text: `#${tag}` });
       }
     }
+  }
+}
+
+// ─── Save Note Modal ──────────────────────────────────────────────────────────
+
+class SaveNoteModal extends Modal {
+  titleValue: string;
+  folderValue: string;
+  onSave: (title: string, folder: string) => Promise<void>;
+
+  constructor(
+    app: App,
+    defaultTitle: string,
+    defaultFolder: string,
+    onSave: (title: string, folder: string) => Promise<void>
+  ) {
+    super(app);
+    this.titleValue = defaultTitle;
+    this.folderValue = defaultFolder;
+    this.onSave = onSave;
+  }
+
+  onOpen() {
+    const { contentEl } = this;
+    contentEl.createEl("h3", { text: "Save as note" });
+
+    new Setting(contentEl)
+      .setName("Title")
+      .addText((text) =>
+        text.setValue(this.titleValue).onChange((value) => {
+          this.titleValue = value;
+        })
+      );
+
+    new Setting(contentEl)
+      .setName("Folder")
+      .addText((text) =>
+        text.setValue(this.folderValue).onChange((value) => {
+          this.folderValue = value;
+        })
+      );
+
+    const buttonRow = contentEl.createDiv({ cls: "second-brain-save-note-buttons" });
+
+    const cancelButton = buttonRow.createEl("button", { text: "Cancel" });
+    cancelButton.addEventListener("click", () => this.close());
+
+    const saveButton = buttonRow.createEl("button", { text: "Save", cls: "mod-cta" });
+    saveButton.addEventListener("click", () => void this.handleSave(saveButton));
+  }
+
+  async handleSave(saveButton: HTMLButtonElement) {
+    saveButton.disabled = true;
+    try {
+      await this.onSave(this.titleValue, this.folderValue);
+      this.close();
+    } catch (e) {
+      const message = e instanceof Error ? e.message : "Failed to save note.";
+      new Notice(message);
+      saveButton.disabled = false;
+    }
+  }
+
+  onClose() {
+    this.contentEl.empty();
   }
 }
 
