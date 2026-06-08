@@ -1242,6 +1242,21 @@ class SearchView extends ItemView {
       });
     }
 
+    const saveResultButton = titleRow.createEl("button", {
+      cls: "second-brain-save-icon-button",
+      attr: { "aria-label": "Save memory as note" },
+    });
+    setIcon(saveResultButton, "file-plus");
+    saveResultButton.addEventListener("click", (evt) => {
+      evt.stopPropagation();
+      new SaveNoteModal(
+        this.app,
+        result.title,
+        this.defaultSaveFolder(),
+        (title, folder) => this.plugin.saveSingleResultAsNote(this.lastQuery, result, title, folder)
+      ).open();
+    });
+
     const bodyText = isExpanded ? result.content.replace(/\s+/g, " ").trim() : result.snippet;
     item.createEl("p", {
       text: bodyText,
