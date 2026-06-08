@@ -238,9 +238,10 @@ export default class SecondBrainPlugin extends Plugin {
     workspace.revealLeaf(leaf);
   }
 
-  onunload() {
-    this.app.workspace.detachLeavesOfType(VIEW_TYPE_SEARCH);
-  }
+  // No onunload override: Obsidian manages leaf lifecycle automatically.
+  // Forcibly detaching leaves on unload resets user-defined leaf positions
+  // and was previously flagged by the Obsidian plugin review process
+  // (see commit 57a804e).
 
   // ── Sync methods ────────────────────────────────────────────────────────────
 
