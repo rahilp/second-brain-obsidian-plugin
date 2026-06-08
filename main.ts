@@ -854,6 +854,7 @@ imported_at: "${importedAt}"${tagsYaml}
 
     const rawLines = content.split("\n");
     const output: string[] = [];
+    const outputInFence: boolean[] = []; // Track fence state for each output line
     let inFence = false;
 
     for (const rawLine of rawLines) {
@@ -864,15 +865,20 @@ imported_at: "${importedAt}"${tagsYaml}
       if (isFenceMarker) {
         if (!inFence) {
           const prev = output.length > 0 ? output[output.length - 1] : null;
-          if (prev !== null && prev.trim() !== "") output.push("");
+          if (prev !== null && prev.trim() !== "") {
+            output.push("");
+            outputInFence.push(false);
+          }
         }
         output.push(trimmedRight);
+        outputInFence.push(inFence); // Record state before toggle
         inFence = !inFence;
         continue;
       }
 
       if (inFence) {
         output.push(rawLine);
+        outputInFence.push(true);
         continue;
       }
 
@@ -888,9 +894,11 @@ imported_at: "${importedAt}"${tagsYaml}
 
       if (trimmed !== "" && prev !== null && prevTrimmed !== "" && lineIsStructural !== prevIsStructural) {
         output.push("");
+        outputInFence.push(false);
       }
 
       output.push(line);
+      outputInFence.push(false);
     }
 
     const collapsed: string[] = [];
@@ -900,7 +908,9 @@ imported_at: "${importedAt}"${tagsYaml}
         let j = i;
         while (j < output.length && output[j].trim() === "") j++;
         const runLength = j - i;
-        if (runLength >= 3) {
+        // Only collapse if NO lines in the run are inside a fence
+        const hasAnyInFence = outputInFence.slice(i, j).some((isFenced) => isFenced);
+        if (runLength >= 3 && !hasAnyInFence) {
           collapsed.push("");
         } else {
           for (let k = i; k < j; k++) collapsed.push(output[k]);
