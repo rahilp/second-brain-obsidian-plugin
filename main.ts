@@ -1321,6 +1321,10 @@ class SaveNoteModal extends Modal {
   }
 
   async handleSave(saveButton: HTMLButtonElement) {
+    if (!this.titleValue.trim()) {
+      new Notice("Title cannot be empty.");
+      return;
+    }
     saveButton.disabled = true;
     try {
       await this.onSave(this.titleValue, this.folderValue);
