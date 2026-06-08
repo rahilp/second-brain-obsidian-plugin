@@ -3,6 +3,7 @@ import {
   Editor,
   ItemView,
   MarkdownView,
+  Modal,
   Plugin,
   PluginSettingTab,
   Setting,
@@ -12,6 +13,7 @@ import {
   WorkspaceLeaf,
   requestUrl,
   normalizePath,
+  setIcon,
 } from "obsidian";
 
 // ─── Settings ─────────────────────────────────────────────────────────────────
@@ -127,6 +129,7 @@ interface NormalizedRecallResult {
   content: string;
   tags: string[];
   score: number | null;
+  createdAt: string | null;
 }
 
 const VIEW_TYPE_SEARCH = "second-brain-search";
@@ -825,6 +828,7 @@ imported_at: "${importedAt}"${tagsYaml}
         content: item.content,
         tags: this.parseMemoryTags(item.tags),
         score: typeof item.score === "number" && Number.isFinite(item.score) ? item.score : null,
+        createdAt: item.created_at != null ? String(item.created_at) : null,
       }));
 
     const insight = typeof data.insight === "string" && data.insight.trim() ? data.insight.trim() : null;
@@ -836,6 +840,210 @@ imported_at: "${importedAt}"${tagsYaml}
     const flat = content.replace(/\s+/g, " ").trim();
     if (flat.length <= maxChars) return flat;
     return flat.slice(0, maxChars).trim() + "…";
+  }
+
+  normalizeMarkdown(content: string): string {
+    const isStructural = (line: string): boolean => {
+      const trimmed = line.trim();
+      return (
+        /^#{1,6}\s/.test(trimmed) ||
+        /^[-*+]\s/.test(trimmed) ||
+        /^\d+[.)]\s/.test(trimmed) ||
+        /^>/.test(trimmed) ||
+        /^```/.test(trimmed)
+      );
+    };
+
+    const rawLines = content.split("\n");
+    const output: string[] = [];
+    const outputInFence: boolean[] = []; // Track fence state for each output line
+    let inFence = false;
+
+    for (const rawLine of rawLines) {
+      const trimmedRight = rawLine.replace(/[ \t]+$/, "");
+      const trimmed = trimmedRight.trim();
+      const isFenceMarker = /^```/.test(trimmed);
+
+      if (isFenceMarker) {
+        if (!inFence) {
+          const prev = output.length > 0 ? output[output.length - 1] : null;
+          if (prev !== null && prev.trim() !== "") {
+            output.push("");
+            outputInFence.push(false);
+          }
+        }
+        output.push(trimmedRight);
+        outputInFence.push(inFence); // Record state before toggle
+        inFence = !inFence;
+        continue;
+      }
+
+      if (inFence) {
+        output.push(rawLine);
+        outputInFence.push(true);
+        continue;
+      }
+
+      let line = trimmedRight;
+      if (/^\s*[*+]\s/.test(line)) {
+        line = line.replace(/^(\s*)[*+](\s)/, "$1-$2");
+      }
+
+      const prev = output.length > 0 ? output[output.length - 1] : null;
+      const prevTrimmed = prev?.trim() ?? "";
+      const prevIsStructural = prev !== null && isStructural(prev);
+      const lineIsStructural = isStructural(line);
+
+      if (trimmed !== "" && prev !== null && prevTrimmed !== "" && lineIsStructural !== prevIsStructural) {
+        output.push("");
+        outputInFence.push(false);
+      }
+
+      output.push(line);
+      outputInFence.push(false);
+    }
+
+    const collapsed: string[] = [];
+    let i = 0;
+    while (i < output.length) {
+      if (output[i].trim() === "") {
+        let j = i;
+        while (j < output.length && output[j].trim() === "") j++;
+        const runLength = j - i;
+        // Only collapse if NO lines in the run are inside a fence
+        const hasAnyInFence = outputInFence.slice(i, j).some((isFenced) => isFenced);
+        if (runLength >= 3 && !hasAnyInFence) {
+          collapsed.push("");
+        } else {
+          for (let k = i; k < j; k++) collapsed.push(output[k]);
+        }
+        i = j;
+      } else {
+        collapsed.push(output[i]);
+        i++;
+      }
+    }
+
+    return collapsed.join("\n").trim();
+  }
+
+  buildFrontmatter(lines: string[]): string {
+    return `---\n${lines.join("\n")}\n---`;
+  }
+
+  async createAndOpenNote(folder: string, title: string, body: string): Promise<void> {
+    const targetFolder = folder.trim() || this.settings.importFolder?.trim() || "_Second Brain/Inbox";
+    await this.ensureFolderExists(targetFolder);
+
+    const sanitizedTitle = this.sanitizeFileName(title);
+    const path = this.getAvailableFilePath(targetFolder, sanitizedTitle);
+
+    await this.app.vault.create(path, body);
+
+    const file = this.app.vault.getAbstractFileByPath(path);
+    if (file instanceof TFile) {
+      await this.app.workspace.getLeaf(true).openFile(file);
+    }
+
+    new Notice(`Saved note: ${sanitizedTitle}`);
+  }
+
+  defaultSearchNoteTitle(query: string): string {
+    const trimmed = query.trim();
+    if (!trimmed) return `Search - ${new Date().toISOString().slice(0, 10)}`;
+    return this.sanitizeFileName(trimmed);
+  }
+
+  defaultInsightNoteTitle(query: string): string {
+    const trimmed = query.trim();
+    if (!trimmed) return `Insight - ${new Date().toISOString().slice(0, 10)}`;
+    return this.sanitizeFileName(`Insight - ${trimmed}`);
+  }
+
+  formatResultDateLabel(createdAt: string | null): string | null {
+    if (!createdAt) return null;
+    const match = createdAt.match(/^\d{4}-\d{2}-\d{2}/);
+    return match ? match[0] : createdAt;
+  }
+
+  async saveSearchResultsAsNote(
+    query: string,
+    results: NormalizedRecallResult[],
+    title: string,
+    folder: string
+  ): Promise<void> {
+    const recalledAt = new Date().toISOString();
+    const escapedQuery = query.replace(/"/g, '\\"');
+
+    const frontmatter = this.buildFrontmatter([
+      `query: "${escapedQuery}"`,
+      `recalled_at: "${recalledAt}"`,
+      `source: second-brain`,
+    ]);
+
+    const entries = results.map((result) => {
+      const meta: string[] = [];
+      if (result.score !== null) meta.push(`score: ${result.score.toFixed(1)}`);
+      const dateLabel = this.formatResultDateLabel(result.createdAt);
+      if (dateLabel) meta.push(dateLabel);
+      const metaText = meta.length > 0 ? ` (${meta.join(" · ")})` : "";
+
+      const normalizedContent = this.normalizeMarkdown(result.content);
+      const indentedContent = normalizedContent
+        .split("\n")
+        .map((line) => (line.trim() === "" ? "" : `  ${line}`))
+        .join("\n");
+
+      const tagsLine = result.tags.length > 0
+        ? `\n  Tags: ${result.tags.map((t) => `#${t}`).join(" ")}`
+        : "";
+
+      return `- **${result.title}**${metaText}\n${indentedContent}${tagsLine}`;
+    });
+
+    const body = `${frontmatter}\n\n# ${title}\n\n${entries.join("\n\n")}\n`;
+    await this.createAndOpenNote(folder, title, body);
+  }
+
+  async saveSingleResultAsNote(
+    query: string,
+    result: NormalizedRecallResult,
+    title: string,
+    folder: string
+  ): Promise<void> {
+    const recalledAt = new Date().toISOString();
+    const escapedQuery = query.replace(/"/g, '\\"');
+
+    const frontmatter = this.buildFrontmatter([
+      `query: "${escapedQuery}"`,
+      `recalled_at: "${recalledAt}"`,
+      `source: second-brain`,
+    ]);
+
+    const normalizedContent = this.normalizeMarkdown(result.content);
+    const body = `${frontmatter}\n\n# ${title}\n\nSource memory ID: ${result.id}\n\n${normalizedContent}\n`;
+    await this.createAndOpenNote(folder, title, body);
+  }
+
+  async saveInsightAsNote(
+    query: string,
+    insight: string,
+    title: string,
+    folder: string
+  ): Promise<void> {
+    const recalledAt = new Date().toISOString();
+    const escapedQuery = query.replace(/"/g, '\\"');
+
+    const frontmatter = this.buildFrontmatter([
+      `query: "${escapedQuery}"`,
+      `recalled_at: "${recalledAt}"`,
+      `source: second-brain`,
+      `type: insight`,
+    ]);
+
+    const normalizedInsight = this.normalizeMarkdown(insight);
+    const body = `${frontmatter}\n\n# ${title}\n\n${normalizedInsight}\n`;
+    await this.createAndOpenNote(folder, title, body);
   }
 
   async loadSettings() {
@@ -856,6 +1064,7 @@ class SearchView extends ItemView {
   expandedIds: Set<string> = new Set();
   isSearching = false;
   requestToken = 0;
+  lastQuery = "";
 
   constructor(leaf: WorkspaceLeaf, plugin: SecondBrainPlugin) {
     super(leaf);
@@ -915,6 +1124,7 @@ class SearchView extends ItemView {
     const query = this.queryInput.value;
     const token = ++this.requestToken;
     this.isSearching = true;
+    this.lastQuery = query;
     this.renderLoading();
 
     try {
@@ -947,12 +1157,32 @@ class SearchView extends ItemView {
     });
   }
 
+  defaultSaveFolder(): string {
+    return this.plugin.settings.importFolder?.trim() || "_Second Brain/Inbox";
+  }
+
   renderResults(results: NormalizedRecallResult[], insight: string | null) {
     this.resultsEl.empty();
 
     if (insight) {
       const insightEl = this.resultsEl.createDiv({ cls: "second-brain-search-insight" });
-      insightEl.setText(insight);
+
+      const insightText = insightEl.createDiv({ cls: "second-brain-search-insight-text" });
+      insightText.setText(insight);
+
+      const saveInsightButton = insightEl.createEl("button", {
+        cls: "second-brain-save-icon-button",
+        attr: { "aria-label": "Save insight as note" },
+      });
+      setIcon(saveInsightButton, "file-plus");
+      saveInsightButton.addEventListener("click", () => {
+        new SaveNoteModal(
+          this.app,
+          this.plugin.defaultInsightNoteTitle(this.lastQuery),
+          this.defaultSaveFolder(),
+          (title, folder) => this.plugin.saveInsightAsNote(this.lastQuery, insight, title, folder)
+        ).open();
+      });
     }
 
     if (results.length === 0) {
@@ -962,6 +1192,17 @@ class SearchView extends ItemView {
       });
       return;
     }
+
+    const saveAllRow = this.resultsEl.createDiv({ cls: "second-brain-search-save-all-row" });
+    const saveAllButton = saveAllRow.createEl("button", { text: "Save all as note" });
+    saveAllButton.addEventListener("click", () => {
+      new SaveNoteModal(
+        this.app,
+        this.plugin.defaultSearchNoteTitle(this.lastQuery),
+        this.defaultSaveFolder(),
+        (title, folder) => this.plugin.saveSearchResultsAsNote(this.lastQuery, results, title, folder)
+      ).open();
+    });
 
     const list = this.resultsEl.createEl("ul", { cls: "second-brain-search-list" });
 
@@ -1001,6 +1242,21 @@ class SearchView extends ItemView {
       });
     }
 
+    const saveResultButton = titleRow.createEl("button", {
+      cls: "second-brain-save-icon-button",
+      attr: { "aria-label": "Save memory as note" },
+    });
+    setIcon(saveResultButton, "file-plus");
+    saveResultButton.addEventListener("click", (evt) => {
+      evt.stopPropagation();
+      new SaveNoteModal(
+        this.app,
+        result.title,
+        this.defaultSaveFolder(),
+        (title, folder) => this.plugin.saveSingleResultAsNote(this.lastQuery, result, title, folder)
+      ).open();
+    });
+
     const bodyText = isExpanded ? result.content.replace(/\s+/g, " ").trim() : result.snippet;
     item.createEl("p", {
       text: bodyText,
@@ -1013,6 +1269,75 @@ class SearchView extends ItemView {
         tagsEl.createEl("span", { text: `#${tag}` });
       }
     }
+  }
+}
+
+// ─── Save Note Modal ──────────────────────────────────────────────────────────
+
+class SaveNoteModal extends Modal {
+  titleValue: string;
+  folderValue: string;
+  onSave: (title: string, folder: string) => Promise<void>;
+
+  constructor(
+    app: App,
+    defaultTitle: string,
+    defaultFolder: string,
+    onSave: (title: string, folder: string) => Promise<void>
+  ) {
+    super(app);
+    this.titleValue = defaultTitle;
+    this.folderValue = defaultFolder;
+    this.onSave = onSave;
+  }
+
+  onOpen() {
+    const { contentEl } = this;
+    contentEl.createEl("h3", { text: "Save as note" });
+
+    new Setting(contentEl)
+      .setName("Title")
+      .addText((text) =>
+        text.setValue(this.titleValue).onChange((value) => {
+          this.titleValue = value;
+        })
+      );
+
+    new Setting(contentEl)
+      .setName("Folder")
+      .addText((text) =>
+        text.setValue(this.folderValue).onChange((value) => {
+          this.folderValue = value;
+        })
+      );
+
+    const buttonRow = contentEl.createDiv({ cls: "second-brain-save-note-buttons" });
+
+    const cancelButton = buttonRow.createEl("button", { text: "Cancel" });
+    cancelButton.addEventListener("click", () => this.close());
+
+    const saveButton = buttonRow.createEl("button", { text: "Save", cls: "mod-cta" });
+    saveButton.addEventListener("click", () => void this.handleSave(saveButton));
+  }
+
+  async handleSave(saveButton: HTMLButtonElement) {
+    if (!this.titleValue.trim()) {
+      new Notice("Title cannot be empty.");
+      return;
+    }
+    saveButton.disabled = true;
+    try {
+      await this.onSave(this.titleValue, this.folderValue);
+      this.close();
+    } catch (e) {
+      const message = e instanceof Error ? e.message : "Failed to save note.";
+      new Notice(message);
+      saveButton.disabled = false;
+    }
+  }
+
+  onClose() {
+    this.contentEl.empty();
   }
 }
 
