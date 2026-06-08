@@ -145,3 +145,6 @@ vite.config.ts.timestamp-*
 
 #system files
 .DS_Store
+
+# local planning/spec docs — never pushed to remote
+/docs
