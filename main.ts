@@ -3,7 +3,6 @@ import {
   Editor,
   ItemView,
   MarkdownView,
-  Modal,
   Plugin,
   PluginSettingTab,
   Setting,
@@ -851,6 +850,11 @@ imported_at: "${importedAt}"${tagsYaml}
 
 class SearchView extends ItemView {
   plugin: SecondBrainPlugin;
+  queryInput: HTMLInputElement;
+  resultsEl: HTMLElement;
+  expandedIds: Set<string> = new Set();
+  isSearching = false;
+  requestToken = 0;
 
   constructor(leaf: WorkspaceLeaf, plugin: SecondBrainPlugin) {
     super(leaf);
@@ -872,35 +876,11 @@ class SearchView extends ItemView {
   async onOpen() {
     const container = this.contentEl;
     container.empty();
-    container.createEl("p", { text: "Second Brain search (coming in Task 3)." });
-  }
+    container.addClass("second-brain-search-view");
 
-  async onClose() {
-    this.contentEl.empty();
-  }
-}
+    container.createEl("h4", { text: "Search Second Brain" });
 
-// ─── Search Modal ─────────────────────────────────────────────────────────────
-
-class SearchModal extends Modal {
-  plugin: SecondBrainPlugin;
-  queryInput: HTMLInputElement;
-  resultsEl: HTMLElement;
-  isSearching = false;
-
-  constructor(app: App, plugin: SecondBrainPlugin) {
-    super(app);
-    this.plugin = plugin;
-  }
-
-  onOpen() {
-    const { contentEl } = this;
-    contentEl.empty();
-    contentEl.addClass("second-brain-search-modal");
-
-    contentEl.createEl("h2", { text: "Search Second Brain" });
-
-    const searchRow = contentEl.createDiv({ cls: "second-brain-search-row" });
+    const searchRow = container.createDiv({ cls: "second-brain-search-row" });
 
     this.queryInput = searchRow.createEl("input", {
       type: "text",
@@ -916,19 +896,17 @@ class SearchModal extends Modal {
       }
     });
 
-    const buttonRow = contentEl.createDiv({ cls: "second-brain-search-buttons" });
+    const buttonRow = container.createDiv({ cls: "second-brain-search-buttons" });
     buttonRow.style.marginTop = "8px";
     buttonRow.style.marginBottom = "12px";
 
     const searchButton = buttonRow.createEl("button", { text: "Search" });
     searchButton.addEventListener("click", () => void this.runSearch());
 
-    this.resultsEl = contentEl.createDiv({ cls: "second-brain-search-results" });
-
-    this.queryInput.focus();
+    this.resultsEl = container.createDiv({ cls: "second-brain-search-results" });
   }
 
-  onClose() {
+  async onClose() {
     this.contentEl.empty();
   }
 
@@ -936,18 +914,24 @@ class SearchModal extends Modal {
     if (this.isSearching) return;
 
     const query = this.queryInput.value;
+    const token = ++this.requestToken;
     this.isSearching = true;
     this.renderLoading();
 
     try {
       const outcome = await this.plugin.recallMemories(query);
+      if (token !== this.requestToken) return; // stale response — a newer search superseded this one
+
+      this.expandedIds.clear();
       if (!outcome.ok) {
         this.renderError(outcome.error);
         return;
       }
       this.renderResults(outcome.results, outcome.insight);
     } finally {
-      this.isSearching = false;
+      if (token === this.requestToken) {
+        this.isSearching = false;
+      }
     }
   }
 
@@ -979,7 +963,7 @@ class SearchModal extends Modal {
 
     if (results.length === 0) {
       this.resultsEl.createEl("p", {
-        text: "No memories found for that query.",
+        text: "No memories found for that search.",
         cls: "second-brain-search-status",
       });
       return;
@@ -990,35 +974,58 @@ class SearchModal extends Modal {
     list.style.padding = "0";
 
     for (const result of results) {
-      const item = list.createEl("li", { cls: "second-brain-search-item" });
-      item.style.padding = "8px 0";
-      item.style.borderBottom = "1px solid var(--background-modifier-border)";
+      this.renderResultItem(list, result);
+    }
+  }
 
-      const titleRow = item.createDiv({ cls: "second-brain-search-item-title" });
-      titleRow.style.display = "flex";
-      titleRow.style.justifyContent = "space-between";
-      titleRow.style.fontWeight = "600";
+  renderResultItem(list: HTMLElement, result: NormalizedRecallResult) {
+    const item = list.createEl("li", { cls: "second-brain-search-item" });
+    item.style.padding = "8px 0";
+    item.style.borderBottom = "1px solid var(--background-modifier-border)";
+    item.style.cursor = "pointer";
 
-      titleRow.createSpan({ text: result.title });
-
-      if (result.score !== null) {
-        titleRow.createSpan({
-          text: result.score.toFixed(1),
-          cls: "second-brain-search-item-score",
-        });
+    item.addEventListener("click", () => {
+      if (this.expandedIds.has(result.id)) {
+        this.expandedIds.delete(result.id);
+      } else {
+        this.expandedIds.add(result.id);
       }
+      item.empty();
+      this.renderResultItemContent(item, result);
+    });
 
-      item.createEl("p", {
-        text: result.snippet,
-        cls: "second-brain-search-item-snippet",
+    this.renderResultItemContent(item, result);
+  }
+
+  renderResultItemContent(item: HTMLElement, result: NormalizedRecallResult) {
+    const isExpanded = this.expandedIds.has(result.id);
+
+    const titleRow = item.createDiv({ cls: "second-brain-search-item-title" });
+    titleRow.style.display = "flex";
+    titleRow.style.justifyContent = "space-between";
+    titleRow.style.fontWeight = "600";
+
+    const titleSpan = titleRow.createSpan();
+    titleSpan.setText(`${isExpanded ? "▾ " : "▸ "}${result.title}`);
+
+    if (result.score !== null) {
+      titleRow.createSpan({
+        text: result.score.toFixed(1),
+        cls: "second-brain-search-item-score",
       });
+    }
 
-      if (result.tags.length > 0) {
-        const tagsEl = item.createDiv({ cls: "second-brain-search-item-tags" });
-        tagsEl.style.fontSize = "0.85em";
-        tagsEl.style.color = "var(--text-muted)";
-        tagsEl.setText(result.tags.map((t) => `#${t}`).join("  "));
-      }
+    const bodyText = isExpanded ? result.content.replace(/\s+/g, " ").trim() : result.snippet;
+    item.createEl("p", {
+      text: bodyText,
+      cls: isExpanded ? "second-brain-search-item-content" : "second-brain-search-item-snippet",
+    });
+
+    if (result.tags.length > 0) {
+      const tagsEl = item.createDiv({ cls: "second-brain-search-item-tags" });
+      tagsEl.style.fontSize = "0.85em";
+      tagsEl.style.color = "var(--text-muted)";
+      tagsEl.setText(result.tags.map((t) => `#${t}`).join("  "));
     }
   }
 }
