@@ -1,38 +1,113 @@
-.second-brain-search-input {
-  width: 100%;
+.second-brain-search-row {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+  margin-bottom: 16px;
 }
 
-.second-brain-search-buttons {
-  margin-top: 8px;
-  margin-bottom: 12px;
+.second-brain-search-input {
+  flex: 1;
+  min-width: 0;
+}
+
+.second-brain-search-button {
+  flex-shrink: 0;
+  white-space: nowrap;
+}
+
+.second-brain-search-results {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.second-brain-search-status {
+  color: var(--text-muted);
+  font-size: 0.9em;
+  padding: 4px 0;
+}
+
+.second-brain-search-error {
+  color: var(--text-error);
 }
 
 .second-brain-search-insight {
-  padding: 8px 12px;
-  margin-bottom: 12px;
+  padding: 10px 14px;
+  margin-bottom: 16px;
   border-radius: 6px;
+  border-left: 3px solid var(--interactive-accent);
   background: var(--background-secondary);
+  color: var(--text-normal);
   font-style: italic;
+  line-height: 1.5;
 }
 
 .second-brain-search-list {
   list-style: none;
   padding: 0;
+  margin: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
 }
 
 .second-brain-search-item {
-  padding: 8px 0;
-  border-bottom: 1px solid var(--background-modifier-border);
+  padding: 10px 12px;
+  border-radius: 6px;
+  border: 1px solid var(--background-modifier-border);
+  background: var(--background-primary);
   cursor: pointer;
+  transition: background-color 0.1s ease-in-out, border-color 0.1s ease-in-out;
+}
+
+.second-brain-search-item:hover {
+  background: var(--background-modifier-hover);
+  border-color: var(--background-modifier-border-hover);
 }
 
 .second-brain-search-item-title {
   display: flex;
   justify-content: space-between;
+  align-items: baseline;
+  gap: 8px;
   font-weight: 600;
+  color: var(--text-normal);
+}
+
+.second-brain-search-item-score {
+  flex-shrink: 0;
+  font-size: 0.75em;
+  font-weight: 600;
+  color: var(--text-on-accent);
+  background: var(--interactive-accent);
+  border-radius: 999px;
+  padding: 2px 8px;
+}
+
+.second-brain-search-item-snippet,
+.second-brain-search-item-content {
+  margin-top: 4px;
+  color: var(--text-muted);
+  font-size: 0.9em;
+  line-height: 1.5;
+}
+
+.second-brain-search-item-content {
+  color: var(--text-normal);
+  white-space: pre-wrap;
 }
 
 .second-brain-search-item-tags {
-  font-size: 0.85em;
+  margin-top: 6px;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+}
+
+.second-brain-search-item-tags span {
+  font-size: 0.75em;
   color: var(--text-muted);
+  background: var(--background-secondary);
+  border-radius: 999px;
+  padding: 1px 8px;
 }

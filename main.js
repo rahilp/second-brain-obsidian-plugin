@@ -588,7 +588,7 @@ ${content}`;
     }
   }
   // ── Search / recall ─────────────────────────────────────────────────────────
-  async recallMemories(query, topK = 10) {
+  async recallMemories(query, topK = 5) {
     const trimmedQuery = query.trim();
     if (!trimmedQuery) {
       return { ok: false, error: "Please enter a search query." };
@@ -691,8 +691,10 @@ var SearchView = class extends import_obsidian.ItemView {
         void this.runSearch();
       }
     });
-    const buttonRow = container.createDiv({ cls: "second-brain-search-buttons" });
-    const searchButton = buttonRow.createEl("button", { text: "Search" });
+    const searchButton = searchRow.createEl("button", {
+      text: "Search",
+      cls: "second-brain-search-button"
+    });
     searchButton.addEventListener("click", () => void this.runSearch());
     this.resultsEl = container.createDiv({ cls: "second-brain-search-results" });
   }
@@ -782,7 +784,9 @@ var SearchView = class extends import_obsidian.ItemView {
     });
     if (result.tags.length > 0) {
       const tagsEl = item.createDiv({ cls: "second-brain-search-item-tags" });
-      tagsEl.setText(result.tags.map((t) => `#${t}`).join("  "));
+      for (const tag of result.tags) {
+        tagsEl.createEl("span", { text: `#${tag}` });
+      }
     }
   }
 };

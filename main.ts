@@ -66,9 +66,9 @@ function chunkText(text: string, maxChars: number, overlapChars: number): string
     let end = start + maxChars;
 
     if (end < text.length) {
-      const lastPeriod  = text.lastIndexOf(".", end);
+      const lastPeriod = text.lastIndexOf(".", end);
       const lastNewline = text.lastIndexOf("\n", end);
-      const breakPoint  = Math.max(lastPeriod, lastNewline);
+      const breakPoint = Math.max(lastPeriod, lastNewline);
       if (breakPoint > start + maxChars / 2) end = breakPoint + 1;
     }
 
@@ -286,10 +286,10 @@ export default class SecondBrainPlugin extends Plugin {
     const tagged = this.settings.syncMode === "all"
       ? files
       : files.filter((f) => {
-          const cache = this.app.metadataCache.getFileCache(f);
-          const tags: string[] = (cache?.frontmatter?.tags as string[] | undefined) ?? [];
-          return tags.includes(this.settings.syncTag);
-        });
+        const cache = this.app.metadataCache.getFileCache(f);
+        const tags: string[] = (cache?.frontmatter?.tags as string[] | undefined) ?? [];
+        return tags.includes(this.settings.syncTag);
+      });
 
     if (!tagged.length) {
       new Notice(this.settings.syncMode === "all"
@@ -761,7 +761,7 @@ imported_at: "${importedAt}"${tagsYaml}
 
   // ── Search / recall ─────────────────────────────────────────────────────────
 
-  async recallMemories(query: string, topK = 10): Promise<
+  async recallMemories(query: string, topK = 5): Promise<
     | { ok: true; results: NormalizedRecallResult[]; insight: string | null }
     | { ok: false; error: string }
   > {
@@ -896,9 +896,10 @@ class SearchView extends ItemView {
       }
     });
 
-    const buttonRow = container.createDiv({ cls: "second-brain-search-buttons" });
-
-    const searchButton = buttonRow.createEl("button", { text: "Search" });
+    const searchButton = searchRow.createEl("button", {
+      text: "Search",
+      cls: "second-brain-search-button",
+    });
     searchButton.addEventListener("click", () => void this.runSearch());
 
     this.resultsEl = container.createDiv({ cls: "second-brain-search-results" });
@@ -1008,7 +1009,9 @@ class SearchView extends ItemView {
 
     if (result.tags.length > 0) {
       const tagsEl = item.createDiv({ cls: "second-brain-search-item-tags" });
-      tagsEl.setText(result.tags.map((t) => `#${t}`).join("  "));
+      for (const tag of result.tags) {
+        tagsEl.createEl("span", { text: `#${tag}` });
+      }
     }
   }
 }
