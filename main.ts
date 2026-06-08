@@ -127,6 +127,7 @@ interface NormalizedRecallResult {
   content: string;
   tags: string[];
   score: number | null;
+  createdAt: string | null;
 }
 
 const VIEW_TYPE_SEARCH = "second-brain-search";
@@ -825,6 +826,7 @@ imported_at: "${importedAt}"${tagsYaml}
         content: item.content,
         tags: this.parseMemoryTags(item.tags),
         score: typeof item.score === "number" && Number.isFinite(item.score) ? item.score : null,
+        createdAt: item.created_at != null ? String(item.created_at) : null,
       }));
 
     const insight = typeof data.insight === "string" && data.insight.trim() ? data.insight.trim() : null;
