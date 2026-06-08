@@ -7,6 +7,7 @@ import {
   PluginSettingTab,
   Setting,
   Notice,
+  RequestUrlResponse,
   TFile,
   WorkspaceLeaf,
   requestUrl,
@@ -227,14 +228,14 @@ export default class SecondBrainPlugin extends Plugin {
 
     const existing = workspace.getLeavesOfType(VIEW_TYPE_SEARCH);
     if (existing.length > 0) {
-      workspace.revealLeaf(existing[0]);
+      await workspace.revealLeaf(existing[0]);
       return;
     }
 
     const leaf = workspace.getRightLeaf(false);
     if (!leaf) return;
     await leaf.setViewState({ type: VIEW_TYPE_SEARCH, active: true });
-    workspace.revealLeaf(leaf);
+    await workspace.revealLeaf(leaf);
   }
 
   // No onunload override: Obsidian manages leaf lifecycle automatically.
@@ -782,7 +783,7 @@ imported_at: "${importedAt}"${tagsYaml}
     const clampedTopK = Math.min(20, Math.max(1, Math.floor(topK)));
     const url = `${workerUrl}/recall?query=${encodeURIComponent(trimmedQuery)}&topK=${clampedTopK}`;
 
-    let response;
+    let response: RequestUrlResponse;
     try {
       response = await requestUrl({
         url,
@@ -887,7 +888,6 @@ class SearchView extends ItemView {
       placeholder: "Ask your Second Brain anything…",
       cls: "second-brain-search-input",
     });
-    this.queryInput.style.width = "100%";
 
     this.queryInput.addEventListener("keydown", (evt) => {
       if (evt.key === "Enter") {
@@ -897,8 +897,6 @@ class SearchView extends ItemView {
     });
 
     const buttonRow = container.createDiv({ cls: "second-brain-search-buttons" });
-    buttonRow.style.marginTop = "8px";
-    buttonRow.style.marginBottom = "12px";
 
     const searchButton = buttonRow.createEl("button", { text: "Search" });
     searchButton.addEventListener("click", () => void this.runSearch());
@@ -953,11 +951,6 @@ class SearchView extends ItemView {
 
     if (insight) {
       const insightEl = this.resultsEl.createDiv({ cls: "second-brain-search-insight" });
-      insightEl.style.padding = "8px 12px";
-      insightEl.style.marginBottom = "12px";
-      insightEl.style.borderRadius = "6px";
-      insightEl.style.background = "var(--background-secondary)";
-      insightEl.style.fontStyle = "italic";
       insightEl.setText(insight);
     }
 
@@ -970,8 +963,6 @@ class SearchView extends ItemView {
     }
 
     const list = this.resultsEl.createEl("ul", { cls: "second-brain-search-list" });
-    list.style.listStyle = "none";
-    list.style.padding = "0";
 
     for (const result of results) {
       this.renderResultItem(list, result);
@@ -980,9 +971,6 @@ class SearchView extends ItemView {
 
   renderResultItem(list: HTMLElement, result: NormalizedRecallResult) {
     const item = list.createEl("li", { cls: "second-brain-search-item" });
-    item.style.padding = "8px 0";
-    item.style.borderBottom = "1px solid var(--background-modifier-border)";
-    item.style.cursor = "pointer";
 
     item.addEventListener("click", () => {
       if (this.expandedIds.has(result.id)) {
@@ -1001,9 +989,6 @@ class SearchView extends ItemView {
     const isExpanded = this.expandedIds.has(result.id);
 
     const titleRow = item.createDiv({ cls: "second-brain-search-item-title" });
-    titleRow.style.display = "flex";
-    titleRow.style.justifyContent = "space-between";
-    titleRow.style.fontWeight = "600";
 
     const titleSpan = titleRow.createSpan();
     titleSpan.setText(`${isExpanded ? "▾ " : "▸ "}${result.title}`);
@@ -1023,8 +1008,6 @@ class SearchView extends ItemView {
 
     if (result.tags.length > 0) {
       const tagsEl = item.createDiv({ cls: "second-brain-search-item-tags" });
-      tagsEl.style.fontSize = "0.85em";
-      tagsEl.style.color = "var(--text-muted)";
       tagsEl.setText(result.tags.map((t) => `#${t}`).join("  "));
     }
   }

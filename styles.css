@@ -1,1 +1,38 @@
-/* No Styles */
+.second-brain-search-input {
+  width: 100%;
+}
+
+.second-brain-search-buttons {
+  margin-top: 8px;
+  margin-bottom: 12px;
+}
+
+.second-brain-search-insight {
+  padding: 8px 12px;
+  margin-bottom: 12px;
+  border-radius: 6px;
+  background: var(--background-secondary);
+  font-style: italic;
+}
+
+.second-brain-search-list {
+  list-style: none;
+  padding: 0;
+}
+
+.second-brain-search-item {
+  padding: 8px 0;
+  border-bottom: 1px solid var(--background-modifier-border);
+  cursor: pointer;
+}
+
+.second-brain-search-item-title {
+  display: flex;
+  justify-content: space-between;
+  font-weight: 600;
+}
+
+.second-brain-search-item-tags {
+  font-size: 0.85em;
+  color: var(--text-muted);
+}

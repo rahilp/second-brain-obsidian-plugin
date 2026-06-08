@@ -140,14 +140,14 @@ var SecondBrainPlugin = class extends import_obsidian.Plugin {
     const { workspace } = this.app;
     const existing = workspace.getLeavesOfType(VIEW_TYPE_SEARCH);
     if (existing.length > 0) {
-      workspace.revealLeaf(existing[0]);
+      await workspace.revealLeaf(existing[0]);
       return;
     }
     const leaf = workspace.getRightLeaf(false);
     if (!leaf)
       return;
     await leaf.setViewState({ type: VIEW_TYPE_SEARCH, active: true });
-    workspace.revealLeaf(leaf);
+    await workspace.revealLeaf(leaf);
   }
   // No onunload override: Obsidian manages leaf lifecycle automatically.
   // Forcibly detaching leaves on unload resets user-defined leaf positions
@@ -685,7 +685,6 @@ var SearchView = class extends import_obsidian.ItemView {
       placeholder: "Ask your Second Brain anything\u2026",
       cls: "second-brain-search-input"
     });
-    this.queryInput.style.width = "100%";
     this.queryInput.addEventListener("keydown", (evt) => {
       if (evt.key === "Enter") {
         evt.preventDefault();
@@ -693,8 +692,6 @@ var SearchView = class extends import_obsidian.ItemView {
       }
     });
     const buttonRow = container.createDiv({ cls: "second-brain-search-buttons" });
-    buttonRow.style.marginTop = "8px";
-    buttonRow.style.marginBottom = "12px";
     const searchButton = buttonRow.createEl("button", { text: "Search" });
     searchButton.addEventListener("click", () => void this.runSearch());
     this.resultsEl = container.createDiv({ cls: "second-brain-search-results" });
@@ -740,11 +737,6 @@ var SearchView = class extends import_obsidian.ItemView {
     this.resultsEl.empty();
     if (insight) {
       const insightEl = this.resultsEl.createDiv({ cls: "second-brain-search-insight" });
-      insightEl.style.padding = "8px 12px";
-      insightEl.style.marginBottom = "12px";
-      insightEl.style.borderRadius = "6px";
-      insightEl.style.background = "var(--background-secondary)";
-      insightEl.style.fontStyle = "italic";
       insightEl.setText(insight);
     }
     if (results.length === 0) {
@@ -755,17 +747,12 @@ var SearchView = class extends import_obsidian.ItemView {
       return;
     }
     const list = this.resultsEl.createEl("ul", { cls: "second-brain-search-list" });
-    list.style.listStyle = "none";
-    list.style.padding = "0";
     for (const result of results) {
       this.renderResultItem(list, result);
     }
   }
   renderResultItem(list, result) {
     const item = list.createEl("li", { cls: "second-brain-search-item" });
-    item.style.padding = "8px 0";
-    item.style.borderBottom = "1px solid var(--background-modifier-border)";
-    item.style.cursor = "pointer";
     item.addEventListener("click", () => {
       if (this.expandedIds.has(result.id)) {
         this.expandedIds.delete(result.id);
@@ -780,9 +767,6 @@ var SearchView = class extends import_obsidian.ItemView {
   renderResultItemContent(item, result) {
     const isExpanded = this.expandedIds.has(result.id);
     const titleRow = item.createDiv({ cls: "second-brain-search-item-title" });
-    titleRow.style.display = "flex";
-    titleRow.style.justifyContent = "space-between";
-    titleRow.style.fontWeight = "600";
     const titleSpan = titleRow.createSpan();
     titleSpan.setText(`${isExpanded ? "\u25BE " : "\u25B8 "}${result.title}`);
     if (result.score !== null) {
@@ -798,8 +782,6 @@ var SearchView = class extends import_obsidian.ItemView {
     });
     if (result.tags.length > 0) {
       const tagsEl = item.createDiv({ cls: "second-brain-search-item-tags" });
-      tagsEl.style.fontSize = "0.85em";
-      tagsEl.style.color = "var(--text-muted)";
       tagsEl.setText(result.tags.map((t) => `#${t}`).join("  "));
     }
   }
