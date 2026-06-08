@@ -1,6 +1,7 @@
 import {
   App,
   Editor,
+  ItemView,
   MarkdownView,
   Modal,
   Plugin,
@@ -8,6 +9,7 @@ import {
   Setting,
   Notice,
   TFile,
+  WorkspaceLeaf,
   requestUrl,
   normalizePath,
 } from "obsidian";
@@ -127,6 +129,8 @@ interface NormalizedRecallResult {
   score: number | null;
 }
 
+const VIEW_TYPE_SEARCH = "second-brain-search";
+
 // ─── Plugin ───────────────────────────────────────────────────────────────────
 
 export default class SecondBrainPlugin extends Plugin {
@@ -139,6 +143,12 @@ export default class SecondBrainPlugin extends Plugin {
 
   async onload() {
     await this.loadSettings();
+
+    this.registerView(VIEW_TYPE_SEARCH, (leaf) => new SearchView(leaf, this));
+
+    this.addRibbonIcon("search", "Search Second Brain memories", () => {
+      void this.activateSearchView();
+    });
 
     if (this.settings.showSyncStatus) {
       this.statusBar = this.addStatusBarItem();
@@ -176,7 +186,7 @@ export default class SecondBrainPlugin extends Plugin {
       id: "search-memories",
       name: "Search memories",
       callback: () => {
-        new SearchModal(this.app, this).open();
+        void this.activateSearchView();
       },
     });
 
@@ -213,8 +223,24 @@ export default class SecondBrainPlugin extends Plugin {
     this.addSettingTab(new SecondBrainSettingTab(this.app, this));
   }
 
-  // FIX: removed onunload that called detachLeavesOfType — Obsidian handles
-  // leaf lifecycle automatically, and registerEvent handles event cleanup.
+  async activateSearchView() {
+    const { workspace } = this.app;
+
+    const existing = workspace.getLeavesOfType(VIEW_TYPE_SEARCH);
+    if (existing.length > 0) {
+      workspace.revealLeaf(existing[0]);
+      return;
+    }
+
+    const leaf = workspace.getRightLeaf(false);
+    if (!leaf) return;
+    await leaf.setViewState({ type: VIEW_TYPE_SEARCH, active: true });
+    workspace.revealLeaf(leaf);
+  }
+
+  onunload() {
+    this.app.workspace.detachLeavesOfType(VIEW_TYPE_SEARCH);
+  }
 
   // ── Sync methods ────────────────────────────────────────────────────────────
 
@@ -817,6 +843,39 @@ imported_at: "${importedAt}"${tagsYaml}
 
   async saveSettings() {
     await this.saveData(this.settings);
+  }
+}
+
+// ─── Search View ──────────────────────────────────────────────────────────────
+
+class SearchView extends ItemView {
+  plugin: SecondBrainPlugin;
+
+  constructor(leaf: WorkspaceLeaf, plugin: SecondBrainPlugin) {
+    super(leaf);
+    this.plugin = plugin;
+  }
+
+  getViewType(): string {
+    return VIEW_TYPE_SEARCH;
+  }
+
+  getDisplayText(): string {
+    return "Second Brain search";
+  }
+
+  getIcon(): string {
+    return "search";
+  }
+
+  async onOpen() {
+    const container = this.contentEl;
+    container.empty();
+    container.createEl("p", { text: "Second Brain search (coming in Task 3)." });
+  }
+
+  async onClose() {
+    this.contentEl.empty();
   }
 }
 
