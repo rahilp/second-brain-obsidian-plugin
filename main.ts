@@ -840,6 +840,81 @@ imported_at: "${importedAt}"${tagsYaml}
     return flat.slice(0, maxChars).trim() + "…";
   }
 
+  normalizeMarkdown(content: string): string {
+    const isStructural = (line: string): boolean => {
+      const trimmed = line.trim();
+      return (
+        /^#{1,6}\s/.test(trimmed) ||
+        /^[-*+]\s/.test(trimmed) ||
+        /^\d+[.)]\s/.test(trimmed) ||
+        /^>/.test(trimmed) ||
+        /^```/.test(trimmed)
+      );
+    };
+
+    const rawLines = content.split("\n");
+    const output: string[] = [];
+    let inFence = false;
+
+    for (const rawLine of rawLines) {
+      const trimmedRight = rawLine.replace(/[ \t]+$/, "");
+      const trimmed = trimmedRight.trim();
+      const isFenceMarker = /^```/.test(trimmed);
+
+      if (isFenceMarker) {
+        if (!inFence) {
+          const prev = output.length > 0 ? output[output.length - 1] : null;
+          if (prev !== null && prev.trim() !== "") output.push("");
+        }
+        output.push(trimmedRight);
+        inFence = !inFence;
+        continue;
+      }
+
+      if (inFence) {
+        output.push(rawLine);
+        continue;
+      }
+
+      let line = trimmedRight;
+      if (/^\s*[*+]\s/.test(line)) {
+        line = line.replace(/^(\s*)[*+](\s)/, "$1-$2");
+      }
+
+      const prev = output.length > 0 ? output[output.length - 1] : null;
+      const prevTrimmed = prev?.trim() ?? "";
+      const prevIsStructural = prev !== null && isStructural(prev);
+      const lineIsStructural = isStructural(line);
+
+      if (trimmed !== "" && prev !== null && prevTrimmed !== "" && lineIsStructural !== prevIsStructural) {
+        output.push("");
+      }
+
+      output.push(line);
+    }
+
+    const collapsed: string[] = [];
+    let i = 0;
+    while (i < output.length) {
+      if (output[i].trim() === "") {
+        let j = i;
+        while (j < output.length && output[j].trim() === "") j++;
+        const runLength = j - i;
+        if (runLength >= 3) {
+          collapsed.push("");
+        } else {
+          for (let k = i; k < j; k++) collapsed.push(output[k]);
+        }
+        i = j;
+      } else {
+        collapsed.push(output[i]);
+        i++;
+      }
+    }
+
+    return collapsed.join("\n").trim();
+  }
+
   async loadSettings() {
     this.settings = Object.assign({}, DEFAULT_SETTINGS, await this.loadData() as unknown as Partial<SecondBrainSettings>);
   }
