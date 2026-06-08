@@ -61,6 +61,7 @@ function chunkText(text, maxChars, overlapChars) {
   }
   return chunks.filter((c) => c.length > 0);
 }
+var VIEW_TYPE_SEARCH = "second-brain-search";
 var SecondBrainPlugin = class extends import_obsidian.Plugin {
   constructor() {
     super(...arguments);
@@ -72,6 +73,10 @@ var SecondBrainPlugin = class extends import_obsidian.Plugin {
   }
   async onload() {
     await this.loadSettings();
+    this.registerView(VIEW_TYPE_SEARCH, (leaf) => new SearchView(leaf, this));
+    this.addRibbonIcon("search", "Search Second Brain memories", () => {
+      void this.activateSearchView();
+    });
     if (this.settings.showSyncStatus) {
       this.statusBar = this.addStatusBarItem();
       this.updateStatusBar();
@@ -96,6 +101,13 @@ var SecondBrainPlugin = class extends import_obsidian.Plugin {
       name: "Import memories",
       callback: async () => {
         await this.importMemories(false);
+      }
+    });
+    this.addCommand({
+      id: "search-memories",
+      name: "Search memories",
+      callback: () => {
+        void this.activateSearchView();
       }
     });
     this.registerEvent(
@@ -124,8 +136,23 @@ var SecondBrainPlugin = class extends import_obsidian.Plugin {
     }
     this.addSettingTab(new SecondBrainSettingTab(this.app, this));
   }
-  // FIX: removed onunload that called detachLeavesOfType — Obsidian handles
-  // leaf lifecycle automatically, and registerEvent handles event cleanup.
+  async activateSearchView() {
+    const { workspace } = this.app;
+    const existing = workspace.getLeavesOfType(VIEW_TYPE_SEARCH);
+    if (existing.length > 0) {
+      await workspace.revealLeaf(existing[0]);
+      return;
+    }
+    const leaf = workspace.getRightLeaf(false);
+    if (!leaf)
+      return;
+    await leaf.setViewState({ type: VIEW_TYPE_SEARCH, active: true });
+    await workspace.revealLeaf(leaf);
+  }
+  // No onunload override: Obsidian manages leaf lifecycle automatically.
+  // Forcibly detaching leaves on unload resets user-defined leaf positions
+  // and was previously flagged by the Obsidian plugin review process
+  // (see commit 57a804e).
   // ── Sync methods ────────────────────────────────────────────────────────────
   async syncActiveNote() {
     const file = this.app.workspace.getActiveFile();
@@ -560,11 +587,207 @@ ${content}`;
       this.isImporting = false;
     }
   }
+  // ── Search / recall ─────────────────────────────────────────────────────────
+  async recallMemories(query, topK = 5) {
+    const trimmedQuery = query.trim();
+    if (!trimmedQuery) {
+      return { ok: false, error: "Please enter a search query." };
+    }
+    if (!this.settings.workerUrl) {
+      return { ok: false, error: "Worker URL is not configured. Go to Settings to configure." };
+    }
+    if (!this.settings.authToken) {
+      return { ok: false, error: "Auth token is not configured. Go to Settings to configure." };
+    }
+    const workerUrl = this.normalizeWorkerUrl(this.settings.workerUrl);
+    const authToken = this.settings.authToken;
+    const clampedTopK = Math.min(20, Math.max(1, Math.floor(topK)));
+    const url = `${workerUrl}/recall?query=${encodeURIComponent(trimmedQuery)}&topK=${clampedTopK}`;
+    let response;
+    try {
+      response = await (0, import_obsidian.requestUrl)({
+        url,
+        method: "GET",
+        headers: {
+          Authorization: `Bearer ${authToken}`,
+          Accept: "application/json"
+        },
+        throw: false
+      });
+    } catch (e) {
+      console.error("Second Brain recall request failed:", e);
+      return { ok: false, error: "Could not reach the Second Brain Worker. Check the Worker URL and your connection." };
+    }
+    if (response.status !== 200) {
+      let errorMsg = `Server returned ${response.status}`;
+      if (response.status === 400) {
+        errorMsg = "Search query was empty or invalid.";
+      } else if (response.status === 401) {
+        errorMsg = "Unauthorized. Please check your auth token.";
+      }
+      return { ok: false, error: errorMsg };
+    }
+    const data = response.json;
+    if (!data || typeof data !== "object" || !Array.isArray(data.results)) {
+      return { ok: false, error: "Unexpected response format from Worker." };
+    }
+    const results = data.results.filter(
+      (item) => typeof (item == null ? void 0 : item.id) === "string" && typeof (item == null ? void 0 : item.content) === "string"
+    ).map((item) => ({
+      id: item.id,
+      title: this.generateMemoryTitle(item.content, item.id),
+      snippet: this.buildSnippet(item.content),
+      content: item.content,
+      tags: this.parseMemoryTags(item.tags),
+      score: typeof item.score === "number" && Number.isFinite(item.score) ? item.score : null
+    }));
+    const insight = typeof data.insight === "string" && data.insight.trim() ? data.insight.trim() : null;
+    return { ok: true, results, insight };
+  }
+  buildSnippet(content, maxChars = 220) {
+    const flat = content.replace(/\s+/g, " ").trim();
+    if (flat.length <= maxChars)
+      return flat;
+    return flat.slice(0, maxChars).trim() + "\u2026";
+  }
   async loadSettings() {
     this.settings = Object.assign({}, DEFAULT_SETTINGS, await this.loadData());
   }
   async saveSettings() {
     await this.saveData(this.settings);
+  }
+};
+var SearchView = class extends import_obsidian.ItemView {
+  constructor(leaf, plugin) {
+    super(leaf);
+    this.expandedIds = /* @__PURE__ */ new Set();
+    this.isSearching = false;
+    this.requestToken = 0;
+    this.plugin = plugin;
+  }
+  getViewType() {
+    return VIEW_TYPE_SEARCH;
+  }
+  getDisplayText() {
+    return "Second Brain search";
+  }
+  getIcon() {
+    return "search";
+  }
+  async onOpen() {
+    const container = this.contentEl;
+    container.empty();
+    container.addClass("second-brain-search-view");
+    container.createEl("h4", { text: "Search Second Brain" });
+    const searchRow = container.createDiv({ cls: "second-brain-search-row" });
+    this.queryInput = searchRow.createEl("input", {
+      type: "text",
+      placeholder: "Ask your Second Brain anything\u2026",
+      cls: "second-brain-search-input"
+    });
+    this.queryInput.addEventListener("keydown", (evt) => {
+      if (evt.key === "Enter") {
+        evt.preventDefault();
+        void this.runSearch();
+      }
+    });
+    const searchButton = searchRow.createEl("button", {
+      text: "Search",
+      cls: "second-brain-search-button"
+    });
+    searchButton.addEventListener("click", () => void this.runSearch());
+    this.resultsEl = container.createDiv({ cls: "second-brain-search-results" });
+  }
+  async onClose() {
+    this.contentEl.empty();
+  }
+  async runSearch() {
+    if (this.isSearching)
+      return;
+    const query = this.queryInput.value;
+    const token = ++this.requestToken;
+    this.isSearching = true;
+    this.renderLoading();
+    try {
+      const outcome = await this.plugin.recallMemories(query);
+      if (token !== this.requestToken)
+        return;
+      this.expandedIds.clear();
+      if (!outcome.ok) {
+        this.renderError(outcome.error);
+        return;
+      }
+      this.renderResults(outcome.results, outcome.insight);
+    } finally {
+      if (token === this.requestToken) {
+        this.isSearching = false;
+      }
+    }
+  }
+  renderLoading() {
+    this.resultsEl.empty();
+    this.resultsEl.createEl("p", { text: "Searching\u2026", cls: "second-brain-search-status" });
+  }
+  renderError(message) {
+    this.resultsEl.empty();
+    this.resultsEl.createEl("p", {
+      text: message,
+      cls: "second-brain-search-status second-brain-search-error"
+    });
+  }
+  renderResults(results, insight) {
+    this.resultsEl.empty();
+    if (insight) {
+      const insightEl = this.resultsEl.createDiv({ cls: "second-brain-search-insight" });
+      insightEl.setText(insight);
+    }
+    if (results.length === 0) {
+      this.resultsEl.createEl("p", {
+        text: "No memories found for that search.",
+        cls: "second-brain-search-status"
+      });
+      return;
+    }
+    const list = this.resultsEl.createEl("ul", { cls: "second-brain-search-list" });
+    for (const result of results) {
+      this.renderResultItem(list, result);
+    }
+  }
+  renderResultItem(list, result) {
+    const item = list.createEl("li", { cls: "second-brain-search-item" });
+    item.addEventListener("click", () => {
+      if (this.expandedIds.has(result.id)) {
+        this.expandedIds.delete(result.id);
+      } else {
+        this.expandedIds.add(result.id);
+      }
+      item.empty();
+      this.renderResultItemContent(item, result);
+    });
+    this.renderResultItemContent(item, result);
+  }
+  renderResultItemContent(item, result) {
+    const isExpanded = this.expandedIds.has(result.id);
+    const titleRow = item.createDiv({ cls: "second-brain-search-item-title" });
+    const titleSpan = titleRow.createSpan();
+    titleSpan.setText(`${isExpanded ? "\u25BE " : "\u25B8 "}${result.title}`);
+    if (result.score !== null) {
+      titleRow.createSpan({
+        text: result.score.toFixed(1),
+        cls: "second-brain-search-item-score"
+      });
+    }
+    const bodyText = isExpanded ? result.content.replace(/\s+/g, " ").trim() : result.snippet;
+    item.createEl("p", {
+      text: bodyText,
+      cls: isExpanded ? "second-brain-search-item-content" : "second-brain-search-item-snippet"
+    });
+    if (result.tags.length > 0) {
+      const tagsEl = item.createDiv({ cls: "second-brain-search-item-tags" });
+      for (const tag of result.tags) {
+        tagsEl.createEl("span", { text: `#${tag}` });
+      }
+    }
   }
 };
 var SecondBrainSettingTab = class extends import_obsidian.PluginSettingTab {
