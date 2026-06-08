@@ -1,6 +1,6 @@
 {
   "name": "second-brain-sync",
-  "version": "1.1.2",
+  "version": "1.2.0",
   "description": "Obsidian plugin to sync notes to your Second Brain MCP server",
   "main": "main.js",
   "scripts": {
