@@ -148,3 +148,6 @@ vite.config.ts.timestamp-*
 
 # local planning/spec docs — never pushed to remote
 /docs
+
+# personal local-testing notes — machine-specific paths
+/local_testing.md
