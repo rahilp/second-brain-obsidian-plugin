@@ -927,6 +927,125 @@ imported_at: "${importedAt}"${tagsYaml}
     return collapsed.join("\n").trim();
   }
 
+  buildFrontmatter(lines: string[]): string {
+    return `---\n${lines.join("\n")}\n---`;
+  }
+
+  async createAndOpenNote(folder: string, title: string, body: string): Promise<void> {
+    const targetFolder = folder.trim() || this.settings.importFolder?.trim() || "_Second Brain/Inbox";
+    await this.ensureFolderExists(targetFolder);
+
+    const sanitizedTitle = this.sanitizeFileName(title);
+    const path = this.getAvailableFilePath(targetFolder, sanitizedTitle);
+
+    await this.app.vault.create(path, body);
+
+    const file = this.app.vault.getAbstractFileByPath(path);
+    if (file instanceof TFile) {
+      await this.app.workspace.getLeaf(true).openFile(file);
+    }
+
+    new Notice(`Saved note: ${sanitizedTitle}`);
+  }
+
+  defaultSearchNoteTitle(query: string): string {
+    const trimmed = query.trim();
+    if (!trimmed) return `Search - ${new Date().toISOString().slice(0, 10)}`;
+    return this.sanitizeFileName(trimmed);
+  }
+
+  defaultInsightNoteTitle(query: string): string {
+    const trimmed = query.trim();
+    if (!trimmed) return `Insight - ${new Date().toISOString().slice(0, 10)}`;
+    return this.sanitizeFileName(`Insight - ${trimmed}`);
+  }
+
+  formatResultDateLabel(createdAt: string | null): string | null {
+    if (!createdAt) return null;
+    const match = createdAt.match(/^\d{4}-\d{2}-\d{2}/);
+    return match ? match[0] : createdAt;
+  }
+
+  async saveSearchResultsAsNote(
+    query: string,
+    results: NormalizedRecallResult[],
+    title: string,
+    folder: string
+  ): Promise<void> {
+    const recalledAt = new Date().toISOString();
+    const escapedQuery = query.replace(/"/g, '\\"');
+
+    const frontmatter = this.buildFrontmatter([
+      `query: "${escapedQuery}"`,
+      `recalled_at: "${recalledAt}"`,
+      `source: second-brain`,
+    ]);
+
+    const entries = results.map((result) => {
+      const meta: string[] = [];
+      if (result.score !== null) meta.push(`score: ${result.score.toFixed(1)}`);
+      const dateLabel = this.formatResultDateLabel(result.createdAt);
+      if (dateLabel) meta.push(dateLabel);
+      const metaText = meta.length > 0 ? ` (${meta.join(" · ")})` : "";
+
+      const normalizedContent = this.normalizeMarkdown(result.content);
+      const indentedContent = normalizedContent
+        .split("\n")
+        .map((line) => (line.trim() === "" ? "" : `  ${line}`))
+        .join("\n");
+
+      const tagsLine = result.tags.length > 0
+        ? `\n  Tags: ${result.tags.map((t) => `#${t}`).join(" ")}`
+        : "";
+
+      return `- **${result.title}**${metaText}\n${indentedContent}${tagsLine}`;
+    });
+
+    const body = `${frontmatter}\n\n# ${title}\n\n${entries.join("\n\n")}\n`;
+    await this.createAndOpenNote(folder, title, body);
+  }
+
+  async saveSingleResultAsNote(
+    query: string,
+    result: NormalizedRecallResult,
+    title: string,
+    folder: string
+  ): Promise<void> {
+    const recalledAt = new Date().toISOString();
+    const escapedQuery = query.replace(/"/g, '\\"');
+
+    const frontmatter = this.buildFrontmatter([
+      `query: "${escapedQuery}"`,
+      `recalled_at: "${recalledAt}"`,
+      `source: second-brain`,
+    ]);
+
+    const normalizedContent = this.normalizeMarkdown(result.content);
+    const body = `${frontmatter}\n\n# ${title}\n\nSource memory ID: ${result.id}\n\n${normalizedContent}\n`;
+    await this.createAndOpenNote(folder, title, body);
+  }
+
+  async saveInsightAsNote(
+    query: string,
+    insight: string,
+    title: string,
+    folder: string
+  ): Promise<void> {
+    const recalledAt = new Date().toISOString();
+    const escapedQuery = query.replace(/"/g, '\\"');
+
+    const frontmatter = this.buildFrontmatter([
+      `query: "${escapedQuery}"`,
+      `recalled_at: "${recalledAt}"`,
+      `source: second-brain`,
+      `type: insight`,
+    ]);
+
+    const normalizedInsight = this.normalizeMarkdown(insight);
+    const body = `${frontmatter}\n\n# ${title}\n\n${normalizedInsight}\n`;
+    await this.createAndOpenNote(folder, title, body);
+  }
+
   async loadSettings() {
     this.settings = Object.assign({}, DEFAULT_SETTINGS, await this.loadData() as unknown as Partial<SecondBrainSettings>);
   }
