@@ -1,17 +1,28 @@
 {
   "name": "second-brain-sync",
-  "version": "1.2.0",
+  "version": "1.3.0",
   "description": "Obsidian plugin to sync notes to your Second Brain MCP server",
   "main": "main.js",
   "scripts": {
-    "build": "npx esbuild main.ts --bundle --external:obsidian --outfile=main.js --platform=node --target=es2018",
+    "build": "npx esbuild main.ts --bundle --minify --external:obsidian --outfile=main.js --platform=node --target=es2018",
     "dev": "npx esbuild main.ts --bundle --external:obsidian --outfile=main.js --platform=node --target=es2018 --watch",
-    "release": "git add . && git commit -m \"$VERSION\" && git push origin main && git tag $VERSION && git push origin $VERSION"
+    "typecheck": "tsc --noEmit",
+    "test": "node --test tests/all.test.mjs",
+    "lint": "eslint --max-warnings=0 main.ts team-runtime.ts",
+    "package:local": "node scripts/package-local.mjs",
+    "check": "npm run typecheck && npm run lint && npm test && npm run build && npm run test:e2e && npm run package:local",
+    "test:e2e": "node --test tests/e2e/all.test.mjs"
   },
   "devDependencies": {
+    "@eslint/js": "^9.39.5",
+    "@eslint/json": "0.14.0",
     "@types/node": "^18.0.0",
     "esbuild": "^0.20.0",
-    "obsidian": "latest",
-    "typescript": "^5.0.0"
+    "eslint": "^9.39.5",
+    "eslint-plugin-obsidianmd": "^0.4.2",
+    "js-yaml": "^4.1.0",
+    "obsidian": "1.8.7",
+    "typescript": "^5.0.0",
+    "typescript-eslint": "^8.70.0"
   }
 }

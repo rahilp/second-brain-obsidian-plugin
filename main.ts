@@ -8,6 +8,7 @@ import {
   PluginSettingTab,
   Setting,
   Notice,
+  Menu,
   RequestUrlResponse,
   TFile,
   WorkspaceLeaf,
@@ -15,6 +16,18 @@ import {
   normalizePath,
   setIcon,
 } from "obsidian";
+import {
+  destinationEquals,
+  destinationToProperties,
+  isValidCaptureResponse,
+  normalizeNoteTags,
+  parseDestinationProperties,
+  resolveLegacyDestination,
+  resolveTeamByName,
+  type Destination,
+  type LegacyWorkspace,
+  type TeamSummary,
+} from "./team-runtime";
 
 // ─── Settings ─────────────────────────────────────────────────────────────────
 
@@ -36,6 +49,7 @@ interface SecondBrainSettings {
   importLimit: number;
   pullOnStartup: boolean;
   importedIds: string[];
+  defaultDestination: Destination;
 }
 
 const DEFAULT_SETTINGS: SecondBrainSettings = {
@@ -54,6 +68,7 @@ const DEFAULT_SETTINGS: SecondBrainSettings = {
   importLimit: 20,
   pullOnStartup: false,
   importedIds: [],
+  defaultDestination: { workspace: "personal" },
 };
 
 // ─── Chunking ─────────────────────────────────────────────────────────────────
@@ -88,6 +103,53 @@ interface ApiResponse {
   ok?: boolean;
   id?: string;
   error?: string;
+}
+
+interface TeamWorkspacesResponse {
+  ok?: boolean;
+  teams?: Array<{ id?: unknown; name?: unknown; memberCount?: unknown }>;
+  admin?: boolean;
+  error?: string;
+}
+
+interface EntryInspection {
+  id: string;
+  workspace: LegacyWorkspace;
+  canEdit: boolean;
+}
+
+interface SyncSnapshot {
+  workerUrl: string;
+  authToken: string;
+  destination: Destination;
+  // The raw (unresolved) destination as read from frontmatter at the top of this sync,
+  // before name/ID decision-table resolution. Used to detect real concurrent edits without
+  // mistaking our own resolution (adopt/backfill/rename/reroute) for staleness.
+  originalDestination?: Destination;
+  settingsGeneration: number;
+  destinationRevision: number;
+}
+
+interface PendingSyncProgress {
+  snapshot: SyncSnapshot;
+  ids: string[];
+  retiredIds: string[];
+}
+
+// Structural equality of two unresolved destinations (workspace + teamId + teamName),
+// used only to detect concurrent frontmatter edits — unlike destinationEquals (teamId-only),
+// this must also notice a hand-edited name so a race during resolution isn't missed.
+function rawDestinationEquals(a: Destination, b: Destination): boolean {
+  return a.workspace === b.workspace
+    && (a.teamId ?? "") === (b.teamId ?? "")
+    && (a.teamName ?? "") === (b.teamName ?? "");
+}
+
+class StaleSyncError extends Error {
+  constructor(message = "Sync stopped because the account or note destination changed. Retry to use the new settings.") {
+    super(message);
+    this.name = "StaleSyncError";
+  }
 }
 
 interface MemoryEntry {
@@ -142,6 +204,17 @@ export default class SecondBrainPlugin extends Plugin {
   // number (browser) rather than NodeJS.Timeout — we use window.setTimeout
   debounceTimers: Map<string, number> = new Map();
   syncingFiles: Set<string> = new Set();
+  destinationRevisions: Map<string, number> = new Map();
+  settingsGeneration = 0;
+  teamCache: TeamSummary[] | null = null;
+  teamCacheKey = "";
+  teamRequestGeneration = 0;
+  teamLoadPromise: Promise<TeamSummary[]> | null = null;
+  teamEndpointUnsupported = false;
+  teamLoadError = "";
+  frontmatterWrites: Set<string> = new Set();
+  frontmatterWriteTimers: Map<string, number> = new Map();
+  pendingSyncProgress: Map<string, PendingSyncProgress> = new Map();
   isImporting = false;
 
   async onload() {
@@ -149,7 +222,7 @@ export default class SecondBrainPlugin extends Plugin {
 
     this.registerView(VIEW_TYPE_SEARCH, (leaf) => new SearchView(leaf, this));
 
-    this.addRibbonIcon("search", "Search Second Brain memories", () => {
+    this.addRibbonIcon("search", "Search second brain memories", () => {
       void this.activateSearchView();
     });
 
@@ -158,7 +231,7 @@ export default class SecondBrainPlugin extends Plugin {
       this.updateStatusBar();
     }
 
-    this.addRibbonIcon("brain", "Sync current note to Second Brain", () => {
+    this.addRibbonIcon("brain", "Sync current note to second brain", () => {
       void this.syncActiveNote();
     });
 
@@ -193,13 +266,45 @@ export default class SecondBrainPlugin extends Plugin {
       },
     });
 
+    this.addCommand({
+      id: "set-memory-destination",
+      name: "Set memory destination",
+      callback: () => {
+        const file = this.app.workspace.getActiveFile();
+        if (!file) {
+          new Notice("Open a Markdown note to set its memory destination.");
+          return;
+        }
+        new DestinationModal(this.app, this, file).open();
+      },
+    });
+
+    this.registerEvent(
+      this.app.workspace.on("file-menu", (menu: Menu, file) => {
+        if (!(file instanceof TFile) || file.extension !== "md") return;
+        menu.addItem((item) => {
+          item.setTitle("Set memory destination").setIcon("share-2").onClick(() => {
+            new DestinationModal(this.app, this, file).open();
+          });
+        });
+      })
+    );
+
     // FIX: always register modify event; gate on this.settings.autoSync inside the
     // handler so toggling auto-sync in settings takes effect immediately without
     // requiring an Obsidian restart.
     this.registerEvent(
       this.app.vault.on("modify", async (file) => {
-        if (!this.settings.autoSync) return;
-        if (file instanceof TFile && file.extension === "md") {
+        if (!(file instanceof TFile) || file.extension !== "md") return;
+        if (this.frontmatterWrites.has(file.path)) {
+          this.frontmatterWrites.delete(file.path);
+          const timer = this.frontmatterWriteTimers.get(file.path);
+          if (timer) window.clearTimeout(timer);
+          this.frontmatterWriteTimers.delete(file.path);
+          return;
+        }
+        this.destinationRevisions.set(file.path, (this.destinationRevisions.get(file.path) ?? 0) + 1);
+        if (this.settings.autoSync) {
           await this.debouncedSyncIfTagged(file);
         }
       })
@@ -241,10 +346,13 @@ export default class SecondBrainPlugin extends Plugin {
     await workspace.revealLeaf(leaf);
   }
 
-  // No onunload override: Obsidian manages leaf lifecycle automatically.
-  // Forcibly detaching leaves on unload resets user-defined leaf positions
-  // and was previously flagged by the Obsidian plugin review process
-  // (see commit 57a804e).
+  onunload() {
+    for (const timer of this.debounceTimers.values()) window.clearTimeout(timer);
+    this.debounceTimers.clear();
+    for (const timer of this.frontmatterWriteTimers.values()) window.clearTimeout(timer);
+    this.frontmatterWriteTimers.clear();
+    this.teamRequestGeneration++;
+  }
 
   // ── Sync methods ────────────────────────────────────────────────────────────
 
@@ -274,11 +382,9 @@ export default class SecondBrainPlugin extends Plugin {
       return;
     }
     const cache = this.app.metadataCache.getFileCache(file);
-    const frontmatterTags: string[] = (cache?.frontmatter?.tags as string[] | undefined) ?? [];
-    // cache.tags includes inline tags (#brain in body); strip the leading #
-    const inlineTags: string[] = (cache?.tags ?? []).map((t) => t.tag.replace(/^#/, ""));
-    const allTags = [...frontmatterTags, ...inlineTags];
-    if (!allTags.includes(this.settings.syncTag)) return;
+    const inlineTags = (cache?.tags ?? []).map((t) => t.tag);
+    const allTags = normalizeNoteTags(cache?.frontmatter?.tags, inlineTags);
+    if (!allTags.includes(this.settings.syncTag.replace(/^#/, ""))) return;
     await this.syncFile(file, silent);
   }
 
@@ -290,8 +396,9 @@ export default class SecondBrainPlugin extends Plugin {
       ? files
       : files.filter((f) => {
         const cache = this.app.metadataCache.getFileCache(f);
-        const tags: string[] = (cache?.frontmatter?.tags as string[] | undefined) ?? [];
-        return tags.includes(this.settings.syncTag);
+        const inlineTags = (cache?.tags ?? []).map((t) => t.tag);
+        const tags = normalizeNoteTags(cache?.frontmatter?.tags, inlineTags);
+        return tags.includes(this.settings.syncTag.replace(/^#/, ""));
       });
 
     if (!tagged.length) {
@@ -310,9 +417,11 @@ export default class SecondBrainPlugin extends Plugin {
       await new Promise((r) => window.setTimeout(r, 300));
     }
 
-    this.settings.lastSyncTime = Date.now();
-    await this.saveSettings();
-    this.updateStatusBar();
+    if (failed === 0) {
+      this.settings.lastSyncTime = Date.now();
+      await this.saveSettings();
+      this.updateStatusBar();
+    }
 
     new Notice(`Second Brain: ${synced} synced${failed ? `, ${failed} failed` : ""}`);
   }
@@ -320,7 +429,7 @@ export default class SecondBrainPlugin extends Plugin {
   async syncFile(file: TFile, silent = false): Promise<boolean> {
     if (!this.validateSettings()) return false;
 
-    if (this.syncingFiles.has(file.path)) return true;
+    if (this.syncingFiles.has(file.path)) return false;
     this.syncingFiles.add(file.path);
 
     try {
@@ -330,35 +439,69 @@ export default class SecondBrainPlugin extends Plugin {
 
       const body = raw.replace(/^---[\s\S]*?---\n?/, "").trim();
       const title = file.basename;
-      const noteTags: string[] = (frontmatter.tags as string[] | undefined) ?? [];
+      const noteTags = normalizeNoteTags(
+        frontmatter.tags,
+        (cache?.tags ?? []).map((tag) => tag.tag),
+      );
 
       // Normalize stored IDs — support legacy single string and new array format.
-      const rawStoredId = frontmatter["second-brain-id"] as string | string[] | undefined;
-      const existingIds: string[] = Array.isArray(rawStoredId)
-        ? rawStoredId
-        : rawStoredId ? [rawStoredId] : [];
+      const existingIds = this.parseIds(frontmatter["second-brain-id"]);
+      const retiredIds = this.parseIds(frontmatter["second-brain-retired-ids"]);
+      const allTrackedIds = Array.from(new Set([...existingIds, ...retiredIds]));
+
+      const workerUrl = this.normalizeWorkerUrl(this.settings.workerUrl);
+      const authToken = this.settings.authToken;
+      const settingsGeneration = this.settingsGeneration;
+      const destinationRevision = this.destinationRevisions.get(file.path) ?? 0;
+      const originalParsed = parseDestinationProperties(
+        frontmatter["second-brain-workspace"],
+        frontmatter["second-brain-team"],
+        frontmatter["second-brain-team-name"],
+      );
+      const destination = await this.resolveDestination(file, frontmatter, allTrackedIds, workerUrl, authToken);
+      const snapshot: SyncSnapshot = {
+        workerUrl,
+        authToken,
+        destination,
+        originalDestination: originalParsed.kind === "valid" ? originalParsed.destination : undefined,
+        settingsGeneration,
+        destinationRevision,
+      };
+      this.assertSnapshotCurrent(snapshot, file);
+
+      // Pin the destination before any move/capture. This is a local vault write
+      // guarded below so it cannot trigger an automatic sync loop.
+      await this.persistDestination(file, snapshot);
 
       const fullContent = `${title}\n\n${body}`;
       const chunks = chunkText(fullContent, this.settings.chunkSize, this.settings.chunkOverlap);
       const capturedTags = [...new Set([...noteTags, "obsidian", file.parent?.name ?? ""].filter(Boolean))];
+      const progressIds = existingIds.slice(0, chunks.length);
+      const activeExistingCount = Math.min(existingIds.length, chunks.length);
+      const shrinkRetiredIds = Array.from(new Set([
+        ...retiredIds,
+        ...existingIds.slice(chunks.length),
+      ]));
 
-      const newIds: string[] = [];
+      // /share is idempotent and must happen before any content update/new
+      // capture. Retired IDs stay tracked so shrinking a note never leaves a
+      // known chunk behind in an old shared destination.
+      for (const id of allTrackedIds) {
+        await this.shareEntry(id, snapshot, file);
+      }
 
       for (let i = 0; i < chunks.length; i++) {
+        this.assertSnapshotCurrent(snapshot, file);
         const chunkContent = chunks.length > 1
           ? `${chunks[i]} [chunk ${i + 1}/${chunks.length}]`
           : chunks[i];
 
         if (i < existingIds.length) {
-          // FIX: use /update (full replace + re-embed) instead of /append.
-          // /append treats the content as an addendum and accumulates it —
-          // re-syncing a note would keep appending the full content on each save.
-          // /update replaces the entry content and re-embeds cleanly.
-          const response = await requestUrl({
-            url: `${this.settings.workerUrl}/update`,
+          const response = await this.requestForSnapshot(snapshot, file, {
+            url: `${snapshot.workerUrl}/update`,
             method: "POST",
             headers: {
-              Authorization: `Bearer ${this.settings.authToken}`,
+              Authorization: `Bearer ${snapshot.authToken}`,
               "Content-Type": "application/json",
             },
             body: JSON.stringify({ id: existingIds[i], content: chunkContent }),
@@ -367,61 +510,60 @@ export default class SecondBrainPlugin extends Plugin {
 
           const updateJson = response.json as ApiResponse;
           if (response.status !== 200 || !updateJson?.ok) {
-            if (!silent) {
-              const errorMsg = updateJson?.error ?? `Server returned ${response.status}`;
-              new Notice(`Second Brain error: ${errorMsg}`);
-            }
+            this.notifySyncError(silent, updateJson?.error ?? `Server returned ${response.status}`);
             return false;
           }
-
-          newIds.push(existingIds[i]);
+          progressIds[i] = existingIds[i];
         } else {
-          // Capture new chunk — either first-time sync or note grew since last sync
-          const response = await requestUrl({
-            url: `${this.settings.workerUrl}/capture`,
+          const response = await this.requestForSnapshot(snapshot, file, {
+            url: `${snapshot.workerUrl}/capture`,
             method: "POST",
             headers: {
-              Authorization: `Bearer ${this.settings.authToken}`,
+              Authorization: `Bearer ${snapshot.authToken}`,
               "Content-Type": "application/json",
             },
             body: JSON.stringify({
               content: chunkContent,
               source: "obsidian",
               tags: capturedTags,
+              workspace: snapshot.destination.workspace,
+              ...(snapshot.destination.workspace === "company"
+                ? { team: snapshot.destination.teamId }
+                : {}),
             }),
             throw: false,
-          });
+          }, false);
 
-          const captureJson = response.json as ApiResponse;
-          if (response.status !== 200) {
-            if (!silent) {
-              const errorMsg = captureJson?.error ?? `Server returned ${response.status}`;
-              new Notice(`Second Brain error: ${errorMsg}`);
-            }
+          const captureResponse = { status: response.status, json: response.json as unknown };
+          if (!isValidCaptureResponse(captureResponse)) {
+            const captureJson = captureResponse.json as ApiResponse;
+            this.notifySyncError(silent, captureJson?.error ?? `Capture did not return a valid memory ID (HTTP ${response.status}).`);
             return false;
           }
-
-          if (captureJson?.id) newIds.push(captureJson.id);
+          progressIds[i] = captureResponse.json.id;
+          this.pendingSyncProgress.set(file.path, {
+            snapshot,
+            ids: this.progressIdsForRetry(existingIds, progressIds, activeExistingCount, i),
+            retiredIds: shrinkRetiredIds,
+          });
+          this.assertSnapshotCurrent(snapshot, file);
         }
+
+        await this.persistSyncProgress(
+          file,
+          this.progressIdsForRetry(existingIds, progressIds, activeExistingCount, i),
+          snapshot,
+          shrinkRetiredIds,
+          false,
+        );
 
         if (i < chunks.length - 1) {
           await new Promise((r) => window.setTimeout(r, 200));
         }
       }
 
-      // Persist IDs for all active chunks. If the note shrank and has fewer chunks
-      // than before, the extra old IDs are no longer tracked (those entries remain
-      // in Second Brain but won't receive further updates). They can be cleaned up
-      // manually via the Second Brain web UI or the forget MCP tool.
-      if (newIds.length > 0) {
-        await this.app.fileManager.processFrontMatter(file, (fm: Record<string, unknown>) => {
-          fm["second-brain-id"] = newIds.length === 1 ? newIds[0] : newIds;
-          const now = new Date();
-          const date = now.toLocaleString("en-US", { month: "long", day: "numeric", year: "numeric" });
-          const time = now.toLocaleString("en-US", { hour: "numeric", minute: "2-digit", hour12: true, timeZoneName: "short" });
-          fm["second-brain-synced"] = `${date} - ${time}`;
-        });
-      }
+      await this.persistSyncProgress(file, progressIds, snapshot, shrinkRetiredIds, true);
+      this.pendingSyncProgress.delete(file.path);
 
       this.settings.lastSyncTime = Date.now();
       await this.saveSettings();
@@ -437,11 +579,378 @@ export default class SecondBrainPlugin extends Plugin {
 
       return true;
     } catch (e) {
-      if (!silent) new Notice("Second Brain: failed to connect to Worker");
-      console.error("Second Brain sync error:", e);
+      const message = e instanceof StaleSyncError
+        ? e.message
+        : "Second Brain: sync failed. Check the Worker connection and retry.";
+      if (!silent) new Notice(message);
       return false;
     } finally {
       this.syncingFiles.delete(file.path);
+    }
+  }
+
+  parseIds(value: unknown): string[] {
+    const values = Array.isArray(value) ? value : [value];
+    return values.filter((id): id is string => typeof id === "string" && id.trim().length > 0);
+  }
+
+  progressIdsForRetry(
+    existingIds: string[],
+    progressIds: string[],
+    activeExistingCount: number,
+    completedIndex: number,
+  ): string[] {
+    const ids = existingIds.slice(0, activeExistingCount);
+    for (let i = activeExistingCount; i <= completedIndex; i++) {
+      if (progressIds[i]) ids[i] = progressIds[i];
+    }
+    return ids.filter((id): id is string => typeof id === "string" && id.length > 0);
+  }
+
+  notifySyncError(silent: boolean, error: string) {
+    if (!silent) new Notice(`Second Brain error: ${error}`);
+  }
+
+  connectionKey(): string {
+    return `${this.normalizeWorkerUrl(this.settings.workerUrl)}\n${this.settings.authToken}`;
+  }
+
+  invalidateTeamCache() {
+    this.teamRequestGeneration++;
+    this.teamCache = null;
+    this.teamCacheKey = "";
+    this.teamLoadPromise = null;
+    this.teamEndpointUnsupported = false;
+    this.teamLoadError = "";
+  }
+
+  async loadTeams(force = false): Promise<TeamSummary[]> {
+    const key = this.connectionKey();
+    if (!force && this.teamCache && this.teamCacheKey === key) return this.teamCache;
+    if (!force && this.teamLoadPromise && this.teamCacheKey === key) return this.teamLoadPromise;
+
+    const requestGeneration = ++this.teamRequestGeneration;
+    const workerUrl = this.normalizeWorkerUrl(this.settings.workerUrl);
+    const authToken = this.settings.authToken;
+    this.teamCacheKey = key;
+    this.teamEndpointUnsupported = false;
+    this.teamLoadError = "";
+
+    const promise = requestUrl({
+      url: `${workerUrl}/team/workspaces`,
+      method: "GET",
+      headers: { Authorization: `Bearer ${authToken}`, Accept: "application/json" },
+      throw: false,
+    }).then((response) => {
+      if (requestGeneration !== this.teamRequestGeneration || key !== this.connectionKey()) {
+        throw new StaleSyncError("Team lookup became stale because the Worker connection changed. Retry.");
+      }
+      if (response.status === 404) {
+        // A pre-team worker may not expose this route. This is the only
+        // capability fallback; auth/network failures remain hard failures.
+        this.teamEndpointUnsupported = true;
+        this.teamCache = [];
+        return [];
+      }
+      if (response.status !== 200) {
+        const message = response.status === 401
+          ? "Team lookup was unauthorized. Check the auth token."
+          : `Team lookup failed (HTTP ${response.status}).`;
+        throw new Error(message);
+      }
+
+      const data = response.json as TeamWorkspacesResponse;
+      if (!data || data.ok !== true || !Array.isArray(data.teams)) {
+        throw new Error("Team lookup returned an invalid response. Retry after checking the Worker.");
+      }
+      const teams: TeamSummary[] = [];
+      for (const rawTeam of data.teams) {
+        if (typeof rawTeam?.id !== "string" || !rawTeam.id.trim() || typeof rawTeam.name !== "string" || !rawTeam.name.trim()) {
+          throw new Error("Team lookup returned a malformed team. Retry after checking the Worker.");
+        }
+        teams.push({
+          id: rawTeam.id.trim(),
+          // Name is kept byte-exact (not trimmed) — it's a human-readable display value
+          // that round-trips into frontmatter, and stripping whitespace here would silently
+          // rewrite whatever the server considers the team's real name.
+          name: rawTeam.name,
+          ...(typeof rawTeam.memberCount === "number" ? { memberCount: rawTeam.memberCount } : {}),
+        });
+      }
+      this.teamCache = teams;
+      this.teamCacheKey = key;
+      return teams;
+    }).catch((error) => {
+      if (requestGeneration === this.teamRequestGeneration && key === this.connectionKey()) {
+        this.teamLoadError = error instanceof Error ? error.message : "Team lookup failed. Retry.";
+      }
+      throw error;
+    }).finally(() => {
+      if (this.teamLoadPromise === promise) this.teamLoadPromise = null;
+    });
+
+    this.teamLoadPromise = promise;
+    return promise;
+  }
+
+  async inspectEntry(id: string, credentials: { workerUrl: string; authToken: string }): Promise<EntryInspection> {
+    const response = await requestUrl({
+      url: `${credentials.workerUrl}/entry?id=${encodeURIComponent(id)}`,
+      method: "GET",
+      headers: { Authorization: `Bearer ${credentials.authToken}`, Accept: "application/json" },
+      throw: false,
+    });
+    const data = response.json as { ok?: unknown; entry?: { id?: unknown; workspace?: unknown; can_edit?: unknown }; error?: string };
+    const workspace = data?.entry?.workspace;
+    if (response.status !== 200 || data?.ok !== true || typeof data?.entry?.id !== "string" ||
+      (workspace !== "personal" && workspace !== "company" && workspace !== "system") ||
+      typeof data.entry.can_edit !== "boolean") {
+      throw new Error(data?.error ?? `Could not inspect tracked memory ${id}.`);
+    }
+    return { id, workspace, canEdit: data.entry.can_edit };
+  }
+
+  async resolveDestination(
+    _file: TFile,
+    frontmatter: Record<string, unknown>,
+    existingIds: string[],
+    workerUrl: string,
+    authToken: string,
+  ): Promise<Destination> {
+    const parsed = parseDestinationProperties(
+      frontmatter["second-brain-workspace"],
+      frontmatter["second-brain-team"],
+      frontmatter["second-brain-team-name"],
+    );
+    const credentials = { workerUrl, authToken };
+
+    if (parsed.kind === "invalid") throw new Error(`Second Brain: ${parsed.reason}`);
+    if (parsed.kind === "valid") {
+      if (parsed.destination.workspace === "personal") return parsed.destination;
+      const teams = await this.loadTeams();
+      if (this.teamEndpointUnsupported) {
+        throw new Error("Second Brain: named team destinations are unavailable on this Worker. Retry after upgrading it.");
+      }
+      return await this.resolveCompanyDestination(parsed.destination, teams);
+    }
+
+    if (existingIds.length === 0) {
+      const configured = this.settings.defaultDestination;
+      const defaultParsed = parseDestinationProperties(configured?.workspace, configured?.teamId, configured?.teamName);
+      if (defaultParsed.kind !== "valid") {
+        throw new Error("Second Brain: choose a valid default destination in settings before syncing.");
+      }
+      if (defaultParsed.destination.workspace === "personal") return defaultParsed.destination;
+      const teams = await this.loadTeams();
+      if (this.teamEndpointUnsupported) {
+        throw new Error("Second Brain: the configured team is unavailable. Choose a named team in settings and retry.");
+      }
+      return await this.resolveCompanyDestination(defaultParsed.destination, teams);
+    }
+
+    const inspected = await Promise.all(existingIds.map((id) => this.inspectEntry(id, credentials)));
+    const resolutionTeams = inspected.some((entry) => entry.workspace === "company")
+      ? await this.loadTeams()
+      : [];
+    const resolution = resolveLegacyDestination(
+      inspected.map((entry) => entry.workspace),
+      resolutionTeams,
+    );
+    if (!resolution.destination) throw new Error(`Second Brain: ${resolution.reason ?? "Choose a destination before syncing."}`);
+    if (inspected.some((entry) => !entry.canEdit)) {
+      throw new Error("Second Brain: at least one tracked memory cannot be edited by this account. Choose a different note or account.");
+    }
+    if (resolution.destination.workspace === "company" && this.teamEndpointUnsupported) {
+      throw new Error("Second Brain: named team destinations are unavailable on this Worker. Retry after upgrading it.");
+    }
+    return resolution.destination;
+  }
+
+  /**
+   * Applies the name/ID decision table for a company destination. The team NAME is
+   * client-side, human-entered, and never trustworthy on its own — the team ID is what
+   * reaches the network. Resolution order: ambiguous name fails closed first (regardless
+   * of ID); a resolved name is always authoritative (covers adopt / no-op / re-route, since
+   * the caller shares tracked IDs to whatever destination this returns); otherwise fall back
+   * to the ID; if neither resolves, fail closed before any capture request.
+   *
+   * Once an ID is chosen, its display name is re-fetched with a forced (non-cached) team
+   * lookup rather than trusted from `teams` — a name matched or an ID validated moments ago
+   * can already be stale if the team was renamed server-side in between.
+   */
+  async resolveCompanyDestination(candidate: Destination, teams: TeamSummary[]): Promise<Destination> {
+    const { teamId, teamName } = candidate;
+    const nameResolution = teamName ? resolveTeamByName(teamName, teams) : null;
+
+    if (nameResolution?.kind === "ambiguous") {
+      const ids = nameResolution.matches.map((team) => team.id).join(", ");
+      const message = `Second Brain: team name "${teamName}" is a collision — it matches multiple teams (${ids}). Resolve it with the destination picker.`;
+      new Notice(message);
+      throw new Error(message);
+    }
+
+    const resolvedId = nameResolution?.kind === "found"
+      ? nameResolution.team.id
+      : teams.find((team) => team.id === teamId)?.id;
+
+    if (!resolvedId) {
+      const message = teamName
+        ? `Second Brain: team name "${teamName}" doesn't match any current team. Choose a destination with the picker.`
+        : "Second Brain: this note's team is unavailable. Choose a current team before syncing.";
+      new Notice(message);
+      throw new Error(message);
+    }
+
+    const freshTeams = await this.loadTeams(true);
+    const freshTeam = freshTeams.find((team) => team.id === resolvedId);
+    if (!freshTeam) {
+      const message = "Second Brain: this note's team is unavailable. Choose a current team before syncing.";
+      new Notice(message);
+      throw new Error(message);
+    }
+    return { workspace: "company", teamId: freshTeam.id, teamName: freshTeam.name };
+  }
+
+  assertSnapshotCurrent(snapshot: SyncSnapshot, file: TFile) {
+    if (snapshot.settingsGeneration !== this.settingsGeneration ||
+      snapshot.workerUrl !== this.normalizeWorkerUrl(this.settings.workerUrl) ||
+      snapshot.authToken !== this.settings.authToken ||
+      snapshot.destinationRevision !== (this.destinationRevisions.get(file.path) ?? 0)) {
+      throw new StaleSyncError();
+    }
+  }
+
+  async requestForSnapshot(
+    snapshot: SyncSnapshot,
+    file: TFile,
+    request: Parameters<typeof requestUrl>[0],
+    checkAfter = true,
+  ): Promise<RequestUrlResponse> {
+    this.assertSnapshotCurrent(snapshot, file);
+    const response = await requestUrl(request);
+    if (checkAfter) this.assertSnapshotCurrent(snapshot, file);
+    return response;
+  }
+
+  async shareEntry(id: string, snapshot: SyncSnapshot, file: TFile) {
+    const response = await this.requestForSnapshot(snapshot, file, {
+      url: `${snapshot.workerUrl}/share`,
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${snapshot.authToken}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        id,
+        workspace: snapshot.destination.workspace,
+        ...(snapshot.destination.workspace === "company" ? { team: snapshot.destination.teamId } : {}),
+      }),
+      throw: false,
+    });
+    const data = response.json as ApiResponse;
+    if (response.status !== 200 || data?.ok !== true) {
+      throw new Error(data?.error ?? `Could not move tracked memory ${id}.`);
+    }
+  }
+
+  async persistDestination(file: TFile, snapshot: SyncSnapshot) {
+    this.assertSnapshotCurrent(snapshot, file);
+    await this.processFrontMatterGuarded(file, (fm) => {
+      const current = parseDestinationProperties(fm["second-brain-workspace"], fm["second-brain-team"], fm["second-brain-team-name"]);
+      // Compare against the RAW destination read at the top of this sync (before
+      // name/ID resolution), not the resolved one — resolution intentionally rewrites
+      // teamId/teamName (adopt/backfill/rename/reroute), which must not look like a race.
+      const stale = current.kind === "invalid"
+        ? true
+        : current.kind === "valid"
+          ? !snapshot.originalDestination || !rawDestinationEquals(current.destination, snapshot.originalDestination)
+          : !!snapshot.originalDestination || (this.destinationRevisions.get(file.path) ?? 0) !== snapshot.destinationRevision;
+      if (stale) throw new StaleSyncError();
+      const properties = destinationToProperties(snapshot.destination);
+      fm["second-brain-workspace"] = properties.workspace;
+      if (snapshot.destination.workspace === "company") {
+        fm["second-brain-team"] = properties.team;
+        if (properties.teamName !== undefined) fm["second-brain-team-name"] = properties.teamName;
+        else delete fm["second-brain-team-name"];
+      } else {
+        delete fm["second-brain-team"];
+        delete fm["second-brain-team-name"];
+      }
+    });
+  }
+
+  async setNoteDestination(file: TFile, destination: Destination) {
+    let teamName: string | undefined;
+    if (destination.workspace === "company") {
+      const teams = await this.loadTeams();
+      const team = destination.teamId ? teams.find((t) => t.id === destination.teamId) : undefined;
+      if (this.teamEndpointUnsupported || !team) {
+        throw new Error("That named team is no longer available. Refresh team membership and try again.");
+      }
+      teamName = team.name;
+    }
+    this.destinationRevisions.set(file.path, (this.destinationRevisions.get(file.path) ?? 0) + 1);
+    await this.processFrontMatterGuarded(file, (fm) => {
+      fm["second-brain-workspace"] = destination.workspace;
+      if (destination.workspace === "company") {
+        fm["second-brain-team"] = destination.teamId;
+        fm["second-brain-team-name"] = teamName;
+      } else {
+        delete fm["second-brain-team"];
+        delete fm["second-brain-team-name"];
+      }
+    });
+  }
+
+  async persistSyncProgress(
+    file: TFile,
+    ids: string[],
+    snapshot: SyncSnapshot,
+    retiredIds: string[],
+    complete: boolean,
+  ) {
+    this.assertSnapshotCurrent(snapshot, file);
+    await this.processFrontMatterGuarded(file, (fm) => {
+      const current = parseDestinationProperties(fm["second-brain-workspace"], fm["second-brain-team"], fm["second-brain-team-name"]);
+      if (current.kind !== "valid" || !destinationEquals(current.destination, snapshot.destination)) {
+        throw new StaleSyncError();
+      }
+      if (snapshot.destination.workspace === "company" && snapshot.destination.teamName !== undefined) {
+        fm["second-brain-team-name"] = snapshot.destination.teamName;
+      }
+      if (ids.length > 0) {
+        fm["second-brain-id"] = ids.length === 1 ? ids[0] : ids;
+      }
+      if (retiredIds.length > 0) {
+        fm["second-brain-retired-ids"] = retiredIds.length === 1 ? retiredIds[0] : retiredIds;
+      } else {
+        delete fm["second-brain-retired-ids"];
+      }
+      if (complete) {
+        const now = new Date();
+        const date = now.toLocaleString("en-US", { month: "long", day: "numeric", year: "numeric" });
+        const time = now.toLocaleString("en-US", { hour: "numeric", minute: "2-digit", hour12: true, timeZoneName: "short" });
+        fm["second-brain-synced"] = `${date} - ${time}`;
+      }
+    });
+  }
+
+  async processFrontMatterGuarded(file: TFile, callback: (fm: Record<string, unknown>) => void) {
+    this.frontmatterWrites.add(file.path);
+    const existingTimer = this.frontmatterWriteTimers.get(file.path);
+    if (existingTimer) window.clearTimeout(existingTimer);
+    this.frontmatterWriteTimers.set(file.path, window.setTimeout(() => {
+      this.frontmatterWrites.delete(file.path);
+      this.frontmatterWriteTimers.delete(file.path);
+    }, 2500));
+    try {
+      await this.app.fileManager.processFrontMatter(file, callback);
+    } catch (error) {
+      this.frontmatterWrites.delete(file.path);
+      const timer = this.frontmatterWriteTimers.get(file.path);
+      if (timer) window.clearTimeout(timer);
+      this.frontmatterWriteTimers.delete(file.path);
+      throw error;
     }
   }
 
@@ -449,11 +958,11 @@ export default class SecondBrainPlugin extends Plugin {
 
   validateSettings(): boolean {
     if (!this.settings.workerUrl) {
-      new Notice("Second Brain: Worker URL not set. Go to Settings to configure.");
+      new Notice("Second brain: worker URL not set. Go to settings to configure.");
       return false;
     }
     if (!this.settings.authToken) {
-      new Notice("Second Brain: Auth token not set. Go to Settings to configure.");
+      new Notice("Second brain: auth token not set. Go to settings to configure.");
       return false;
     }
     return true;
@@ -603,7 +1112,7 @@ export default class SecondBrainPlugin extends Plugin {
     }
 
     this.isImporting = true;
-    if (!silent) new Notice("Starting import from Second Brain...");
+    if (!silent) new Notice("Starting import from second brain...");
 
     try {
       const workerUrl = this.normalizeWorkerUrl(this.settings.workerUrl);
@@ -699,7 +1208,7 @@ export default class SecondBrainPlugin extends Plugin {
           // Escaping double quotes in YAML fields
           const cleanId = id.replace(/"/g, '\\"');
           const source = (typeof item.source === "string") ? item.source.replace(/"/g, '\\"') : "external-memory";
-          const createdAt = item.created_at != null ? String(item.created_at).replace(/"/g, '\\"') : "";
+          const createdAt = this.formatExternalValue(item.created_at).replace(/"/g, '\\"');
           const importedAt = new Date().toISOString();
 
           // Build markdown content
@@ -756,7 +1265,7 @@ imported_at: "${importedAt}"${tagsYaml}
       }
     } catch (e) {
       console.error("Import memories critical error:", e);
-      if (!silent) new Notice("Second Brain import failed: check console logs for details.");
+      if (!silent) new Notice("Second brain import failed: check console logs for details.");
     } finally {
       this.isImporting = false;
     }
@@ -828,7 +1337,7 @@ imported_at: "${importedAt}"${tagsYaml}
         content: item.content,
         tags: this.parseMemoryTags(item.tags),
         score: typeof item.score === "number" && Number.isFinite(item.score) ? item.score : null,
-        createdAt: item.created_at != null ? String(item.created_at) : null,
+        createdAt: this.formatExternalValue(item.created_at) || null,
       }));
 
     const insight = typeof data.insight === "string" && data.insight.trim() ? data.insight.trim() : null;
@@ -840,6 +1349,13 @@ imported_at: "${importedAt}"${tagsYaml}
     const flat = content.replace(/\s+/g, " ").trim();
     if (flat.length <= maxChars) return flat;
     return flat.slice(0, maxChars).trim() + "…";
+  }
+
+  formatExternalValue(value: unknown): string {
+    if (typeof value === "string" || typeof value === "number" || typeof value === "boolean") {
+      return String(value);
+    }
+    return "";
   }
 
   normalizeMarkdown(content: string): string {
@@ -1047,7 +1563,9 @@ imported_at: "${importedAt}"${tagsYaml}
   }
 
   async loadSettings() {
-    this.settings = Object.assign({}, DEFAULT_SETTINGS, await this.loadData() as unknown as Partial<SecondBrainSettings>);
+    const stored = await this.loadData() as unknown as Partial<SecondBrainSettings>;
+    this.settings = Object.assign({}, DEFAULT_SETTINGS, stored);
+    if (!stored?.defaultDestination) this.settings.defaultDestination = { workspace: "personal" };
   }
 
   async saveSettings() {
@@ -1076,7 +1594,7 @@ class SearchView extends ItemView {
   }
 
   getDisplayText(): string {
-    return "Second Brain search";
+    return "Second brain search";
   }
 
   getIcon(): string {
@@ -1088,7 +1606,7 @@ class SearchView extends ItemView {
     container.empty();
     container.addClass("second-brain-search-view");
 
-    container.createEl("h4", { text: "Search Second Brain" });
+    container.createEl("h4", { text: "Search second brain" });
 
     const searchRow = container.createDiv({ cls: "second-brain-search-row" });
 
@@ -1266,9 +1784,109 @@ class SearchView extends ItemView {
     if (result.tags.length > 0) {
       const tagsEl = item.createDiv({ cls: "second-brain-search-item-tags" });
       for (const tag of result.tags) {
-        tagsEl.createEl("span", { text: `#${tag}` });
+        tagsEl.createSpan({ text: `#${tag}` });
       }
     }
+  }
+}
+
+class DestinationModal extends Modal {
+  plugin: SecondBrainPlugin;
+  file: TFile;
+  selected: Destination;
+  teams: TeamSummary[] = [];
+  loading = true;
+  error = "";
+  saveButton: HTMLButtonElement | null = null;
+
+  constructor(app: App, plugin: SecondBrainPlugin, file: TFile) {
+    super(app);
+    this.plugin = plugin;
+    this.file = file;
+    const frontmatter = this.plugin.app.metadataCache.getFileCache(file)?.frontmatter ?? {};
+    const parsed = parseDestinationProperties(
+      frontmatter["second-brain-workspace"],
+      frontmatter["second-brain-team"],
+      frontmatter["second-brain-team-name"],
+    );
+    this.selected = parsed.kind === "valid" ? parsed.destination : this.plugin.settings.defaultDestination;
+    if (this.selected.workspace === "company" && !this.selected.teamId) {
+      this.selected = { workspace: "personal" };
+    }
+  }
+
+  onOpen() {
+    this.render();
+    void this.loadTeamsForPicker();
+  }
+
+  async loadTeamsForPicker() {
+    try {
+      this.teams = await this.plugin.loadTeams();
+    } catch (error) {
+      this.error = error instanceof Error ? error.message : "Team lookup failed. Retry.";
+    } finally {
+      this.loading = false;
+      this.render();
+    }
+  }
+
+  render() {
+    const { contentEl } = this;
+    contentEl.empty();
+    contentEl.createEl("h3", { text: "Memory destination" });
+    contentEl.createEl("p", {
+      text: "Choose where this note's future syncs are stored. Existing tracked memories will move there on the next sync.",
+      cls: "setting-item-description",
+    });
+    if (this.error) {
+      contentEl.createEl("p", { text: this.error, cls: "second-brain-destination-error" });
+    }
+
+    const destinationSetting = new Setting(contentEl)
+      .setName("Destination")
+      .setDesc(this.loading ? "Loading named teams…" : "Team names come from your current Worker membership.");
+    destinationSetting.addDropdown((dropdown) => {
+      dropdown.addOption("personal", "Personal");
+      for (const team of this.teams) dropdown.addOption(team.id, team.name);
+      const selectedValue = this.selected.workspace === "company" ? this.selected.teamId : "personal";
+      if (selectedValue && (selectedValue === "personal" || this.teams.some((team) => team.id === selectedValue))) {
+        dropdown.setValue(selectedValue);
+      } else {
+        dropdown.setValue("personal");
+      }
+      dropdown.onChange((value) => {
+        this.selected = value === "personal"
+          ? { workspace: "personal" }
+          : { workspace: "company", teamId: value };
+      });
+    });
+
+    const buttonRow = contentEl.createDiv({ cls: "second-brain-destination-buttons" });
+    const cancelButton = buttonRow.createEl("button", { text: "Cancel" });
+    cancelButton.addEventListener("click", () => this.close());
+    this.saveButton = buttonRow.createEl("button", { text: "Save", cls: "mod-cta" });
+    this.saveButton.addEventListener("click", () => void this.saveSelection());
+  }
+
+  async saveSelection() {
+    if (this.selected.workspace === "company" &&
+      (!this.selected.teamId || !this.teams.some((team) => team.id === this.selected.teamId))) {
+      new Notice("Choose a current named team before saving.");
+      return;
+    }
+    if (this.saveButton) this.saveButton.disabled = true;
+    try {
+      await this.plugin.setNoteDestination(this.file, this.selected);
+      this.close();
+    } catch (error) {
+      new Notice(error instanceof Error ? error.message : "Could not save the memory destination.");
+      if (this.saveButton) this.saveButton.disabled = false;
+    }
+  }
+
+  onClose() {
+    this.contentEl.empty();
   }
 }
 
@@ -1351,6 +1969,10 @@ class SecondBrainSettingTab extends PluginSettingTab {
     this.plugin = plugin;
   }
 
+  getSettingDefinitions() {
+    return [];
+  }
+
   display(): void {
     this.render();
   }
@@ -1359,7 +1981,7 @@ class SecondBrainSettingTab extends PluginSettingTab {
     const { containerEl } = this;
     containerEl.empty();
 
-    new Setting(containerEl).setName("Second Brain").setHeading();
+    new Setting(containerEl).setName("Second brain").setHeading();
 
     // ── Connection ──────────────────────────────────────────────────────────
     new Setting(containerEl).setName("Connection").setHeading();
@@ -1373,20 +1995,26 @@ class SecondBrainSettingTab extends PluginSettingTab {
           .setValue(this.plugin.settings.workerUrl)
           .onChange(async (value) => {
             this.plugin.settings.workerUrl = value.trim().replace(/\/$/, "");
+            this.plugin.settingsGeneration++;
+            this.plugin.invalidateTeamCache();
             await this.plugin.saveSettings();
+            this.render();
           })
       );
 
     new Setting(containerEl)
       .setName("Auth token")
-      .setDesc("Your AUTH_TOKEN Worker secret. Keep this private.")
+      .setDesc("Your worker auth token. Keep this private.")
       .addText((text) => {
         text
-          .setPlaceholder("paste your token here")
+          .setPlaceholder("Paste your token here")
           .setValue(this.plugin.settings.authToken)
           .onChange(async (value) => {
             this.plugin.settings.authToken = value.trim();
+            this.plugin.settingsGeneration++;
+            this.plugin.invalidateTeamCache();
             await this.plugin.saveSettings();
+            this.render();
           });
         text.inputEl.type = "password";
         return text;
@@ -1394,7 +2022,7 @@ class SecondBrainSettingTab extends PluginSettingTab {
 
     new Setting(containerEl)
       .setName("Test connection")
-      .setDesc("Verify your Worker URL and token are correct")
+      .setDesc("Verify your worker URL and token are correct")
       .addButton((btn) =>
         btn
           .setButtonText("Test")
@@ -1407,20 +2035,51 @@ class SecondBrainSettingTab extends PluginSettingTab {
                 throw: false,
               });
               if (response.status === 200) {
-                new Notice("Second Brain: connected successfully");
+                new Notice("Second brain: connected successfully");
               } else if (response.status === 401) {
-                new Notice("Second Brain: auth token is wrong");
+                new Notice("Second brain: auth token is wrong");
               } else {
-                new Notice(`Second Brain: unexpected status ${response.status}`);
+                new Notice(`Second brain: unexpected status ${response.status}`);
               }
             } catch {
-              new Notice("Second Brain: could not reach Worker — check the URL");
+              new Notice("Second brain: could not reach worker — check the URL");
             }
           })
       );
 
     // ── Sync behaviour ──────────────────────────────────────────────────────
     new Setting(containerEl).setName("Sync behaviour").setHeading();
+
+    const defaultDestination = this.plugin.settings.defaultDestination;
+    const defaultTeams = this.plugin.teamCacheKey === this.plugin.connectionKey()
+      ? (this.plugin.teamCache ?? [])
+      : [];
+    new Setting(containerEl)
+      .setName("Default memory destination")
+      .setDesc("Applies only to notes that have not synced before. Existing notes keep their pinned destination.")
+      .addDropdown((dropdown) => {
+        dropdown.addOption("personal", "Personal");
+        for (const team of defaultTeams) dropdown.addOption(team.id, team.name);
+        const configured = defaultDestination.workspace === "company" ? defaultDestination.teamId : "personal";
+        if (configured && (configured === "personal" || defaultTeams.some((team) => team.id === configured))) {
+          dropdown.setValue(configured);
+        } else {
+          dropdown.setValue("personal");
+        }
+        dropdown.onChange(async (value) => {
+          this.plugin.settings.defaultDestination = value === "personal"
+            ? { workspace: "personal" }
+            : { workspace: "company", teamId: value, teamName: defaultTeams.find((team) => team.id === value)?.name };
+          this.plugin.settingsGeneration++;
+          await this.plugin.saveSettings();
+          this.render();
+        });
+      });
+
+    if (this.plugin.settings.workerUrl && this.plugin.settings.authToken &&
+      this.plugin.teamCacheKey !== this.plugin.connectionKey() && !this.plugin.teamLoadPromise) {
+      void this.plugin.loadTeams().then(() => this.render()).catch(() => undefined);
+    }
 
     new Setting(containerEl)
       .setName("Sync mode")
@@ -1443,7 +2102,7 @@ class SecondBrainSettingTab extends PluginSettingTab {
         .setDesc("Only notes with this tag in their frontmatter will be synced. Default: brain")
         .addText((text) =>
           text
-            .setPlaceholder("brain")
+            .setPlaceholder("Brain")
             .setValue(this.plugin.settings.syncTag)
             .onChange(async (value) => {
               this.plugin.settings.syncTag = value.trim() || "brain";
@@ -1525,7 +2184,7 @@ class SecondBrainSettingTab extends PluginSettingTab {
       .setDesc("Folder where imported memories will be saved.")
       .addText((text) =>
         text
-          .setPlaceholder("_Second Brain/Inbox")
+          .setPlaceholder("_second brain/inbox")
           .setValue(this.plugin.settings.importFolder)
           .onChange(async (value) => {
             this.plugin.settings.importFolder = value.trim() || "_Second Brain/Inbox";
@@ -1538,7 +2197,7 @@ class SecondBrainSettingTab extends PluginSettingTab {
       .setDesc("Tag used to filter external memories to import.")
       .addText((text) =>
         text
-          .setPlaceholder("obsidian-inbox")
+          .setPlaceholder("Obsidian-inbox")
           .setValue(this.plugin.settings.importTag)
           .onChange(async (value) => {
             this.plugin.settings.importTag = value.trim() || "obsidian-inbox";
@@ -1567,7 +2226,7 @@ class SecondBrainSettingTab extends PluginSettingTab {
 
     new Setting(containerEl)
       .setName("Pull/import on startup")
-      .setDesc("Automatically pull memories from your Second Brain when Obsidian starts.")
+      .setDesc("Automatically pull memories from your second brain when Obsidian starts.")
       .addToggle((toggle) =>
         toggle
           .setValue(this.plugin.settings.pullOnStartup)
@@ -1578,7 +2237,7 @@ class SecondBrainSettingTab extends PluginSettingTab {
       );
 
     new Setting(containerEl)
-      .setName("Reset imported IDs cache")
+      .setName("Reset imported ids cache")
       .setDesc(`Clear the list of previously imported memory IDs. Currently contains ${this.plugin.settings.importedIds?.length ?? 0} ID(s).`)
       .addButton((btn) =>
         btn
@@ -1587,7 +2246,7 @@ class SecondBrainSettingTab extends PluginSettingTab {
             this.plugin.settings.importedIds = [];
             await this.plugin.saveSettings();
             this.render();
-            new Notice("Imported IDs cache has been reset");
+            new Notice("Imported ids cache has been reset");
           })
       );
 
