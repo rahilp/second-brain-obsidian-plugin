@@ -23,26 +23,21 @@ jobs:
       - name: Install dependencies
         run: npm install
 
-      - name: Bump version in manifests
+      # The version lives in the repo and must be committed BEFORE tagging.
+      # Bumping it here instead would rewrite the manifest *after* the tag already
+      # exists, so the tagged commit would never contain the version it released —
+      # which is what triggered Obsidian's "Release manifest differs from repository
+      # manifest version" warning. Verify instead of mutate.
+      - name: Verify tag matches committed version
         run: |
           VERSION=${{ github.ref_name }}
-          node -e "
-            const fs = require('fs');
-            const m = JSON.parse(fs.readFileSync('manifest.json'));
-            m.version = '$VERSION';
-            fs.writeFileSync('manifest.json', JSON.stringify(m, null, 2) + '\n');
-            const p = JSON.parse(fs.readFileSync('package.json'));
-            p.version = '$VERSION';
-            fs.writeFileSync('package.json', JSON.stringify(p, null, 2) + '\n');
-          "
-
-      - name: Commit version bump
-        run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add manifest.json package.json
-          git commit -m "chore: bump version to ${{ github.ref_name }}"
-          git push origin HEAD:main
+          MANIFEST=$(node -p "require('./manifest.json').version")
+          PKG=$(node -p "require('./package.json').version")
+          echo "tag=$VERSION manifest.json=$MANIFEST package.json=$PKG"
+          if [ "$MANIFEST" != "$VERSION" ] || [ "$PKG" != "$VERSION" ]; then
+            echo "::error::Tag $VERSION does not match manifest.json ($MANIFEST) or package.json ($PKG). Bump both, commit to main, then tag that commit."
+            exit 1
+          fi
 
       - name: Build
         run: npm run build
