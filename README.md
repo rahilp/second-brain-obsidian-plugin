@@ -11,6 +11,7 @@ Built on [Cloudflare Workers + Vectorize](https://github.com/rahilp/second-brain
 - Sync any note to your Second Brain with one click or a hotkey
 - Bulk sync all notes with a specific tag
 - Auto-sync tagged notes every time you save
+- **Choose whether each note goes to your personal memory or a specific team**
 - **Import memories from your Second Brain back into Obsidian as notes**
 - Chunk long notes automatically so embeddings stay clean
 - Status bar shows the last time you synced
@@ -58,6 +59,50 @@ Then sync it:
 
 ---
 
+## Choosing where a note goes: personal or a team
+
+If your Second Brain has team workspaces, every note you sync lands in one of two places: your **personal** memory, which only you can see, or a **team** memory shared with everyone on that team.
+
+New notes use whatever you pick in **Settings → Default memory destination**. Changing that default only affects notes you sync from then on — it never moves notes you've already synced.
+
+To set the destination for one specific note:
+
+- Right-click the note → **Set memory destination**, or
+- `Ctrl/Cmd + P` → **Set memory destination**
+
+Pick from the list of your actual team names. If the note has already been synced, changing its destination **moves** its existing memories to the new place rather than leaving copies behind.
+
+### What gets written to your note
+
+Once a note has a destination, you'll see it in the frontmatter:
+
+```yaml
+---
+second-brain-workspace: company
+second-brain-team: 7f3a9c2e-4b81-4d2a-9f30-1c5e8a2d6b04
+second-brain-team-name: Acme Engineering
+---
+```
+
+There are two team fields because they do different jobs:
+
+- **`second-brain-team-name`** is the readable one, and you can edit it by hand. Type a different team name here and the note moves to that team on the next sync.
+- **`second-brain-team`** is the stable ID. It's what actually gets sent, so renaming a team on the server never breaks your notes — the plugin just refreshes the name for you.
+
+A personal note simply has `second-brain-workspace: personal` and no team fields.
+
+### When it refuses to sync
+
+Sharing a note with the wrong team isn't something you can quietly undo, so the plugin stops rather than guesses. A sync will fail, with a message explaining why, if:
+
+- the team name you typed doesn't match any team you're currently in
+- the name matches **two or more** teams, so it's ambiguous which one you meant
+- you've been removed from the team the note points at
+
+In each case nothing is sent anywhere. Open the destination picker, choose a team explicitly, and sync again.
+
+---
+
 ## Importing memories into Obsidian
 
 You can pull memories from your Second Brain back into Obsidian as Markdown notes. This is useful for surfacing things Claude, ChatGPT, or other AI tools have remembered on your behalf.
@@ -96,6 +141,7 @@ Already-imported memories are skipped automatically on subsequent runs. You can 
 ### Sync behaviour
 | Setting | Description | Default |
 |---|---|---|
+| Default memory destination | Where newly synced notes go — personal, or one of your teams. Does not move notes you've already synced | Personal |
 | Sync mode | Sync all notes, or only tagged ones | Tagged only |
 | Sync tag | The tag that marks a note for sync (frontmatter or inline) | `brain` |
 | Auto-sync on save | Sync automatically when you save | Off |
